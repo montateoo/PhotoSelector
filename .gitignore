@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+PhotoSelector.exe
+PhotoSelector.spec
+icon.ico
+icon_preview.png
