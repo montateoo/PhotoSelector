@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QProgressBar,
     QListWidget, QListWidgetItem, QAbstractItemView,
     QStyledItemDelegate, QListView, QStyle,
-    QDialog, QLineEdit, QDialogButtonBox,
+    QDialog, QLineEdit, QDialogButtonBox, QInputDialog,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QSize, QUrl
 from PyQt5.QtGui import (
@@ -631,15 +631,11 @@ class ImageView(QGraphicsView):
         self.resetTransform()
         self._fit()
 
-    def show_placeholder(self, text: str):
+    def show_placeholder(self, text: str = ""):
         self._scene.clear()
         self._item = None
-        item = self._scene.addText(text)
-        item.setDefaultTextColor(QColor("#555"))
-        item.setFont(QFont("Segoe UI", 15))
-        self._scene.setSceneRect(item.boundingRect())
+        self._scene.setSceneRect(QRectF(0, 0, 1, 1))
         self.resetTransform()
-        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
     def _fit(self):
         if self._item:
@@ -656,7 +652,14 @@ class ImageView(QGraphicsView):
         self._zoom = new
 
     def wheelEvent(self, event):
-        self._scale(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+        if self._item:
+            self._scale(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self._fit()
+        else:
+            super().mousePressEvent(event)
 
     def keyPressEvent(self, event):
         NAV = (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
@@ -947,6 +950,7 @@ class PhotoSelector(QMainWindow):
         self._rotate_thumb_idx: int | None             = None  # needs thumb regen
         self._share_worker:   FilemailUploader | None  = None
         self._share_progress: QProgressDialog | None   = None
+        self._dest_folder:    str                       = DEST_FOLDER
 
         self._build_ui()
         self._connect()
@@ -1001,6 +1005,8 @@ class PhotoSelector(QMainWindow):
         self.btn_copy = QPushButton("📋  Copia selezionate  (0)")
         self.btn_copy.setFixedHeight(36)
         self.btn_copy.setStyleSheet(ACCENT_STYLE)
+        self.btn_copy.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_copy.customContextMenuRequested.connect(self._set_dest_folder)
 
         self.btn_share = QPushButton("📤  Condividi")
         self.btn_share.setFixedHeight(36)
@@ -1016,16 +1022,15 @@ class PhotoSelector(QMainWindow):
         self.btn_info.setFixedHeight(36)
         self.btn_info.setCheckable(True)
 
-        _rot_style = "QPushButton { font-size: 20px; } QPushButton:disabled { color: #444; }"
-        self.btn_rot_left  = QPushButton("↺")
-        self.btn_rot_left.setFixedSize(36, 36)
+        self.btn_rot_left  = QPushButton("Rot. SX")
+        self.btn_rot_left.setFixedHeight(36)
+        self.btn_rot_left.setMinimumWidth(72)
         self.btn_rot_left.setToolTip("Ruota a sinistra  [[]")
-        self.btn_rot_left.setStyleSheet(_rot_style)
 
-        self.btn_rot_right = QPushButton("↻")
-        self.btn_rot_right.setFixedSize(36, 36)
+        self.btn_rot_right = QPushButton("Rot. DX")
+        self.btn_rot_right.setFixedHeight(36)
+        self.btn_rot_right.setMinimumWidth(72)
         self.btn_rot_right.setToolTip("Ruota a destra  []]")
-        self.btn_rot_right.setStyleSheet(_rot_style)
 
         self.btn_zout  = QPushButton("−")
         self.btn_zout.setFixedSize(36, 36)
@@ -1326,13 +1331,27 @@ class PhotoSelector(QMainWindow):
             self.filmstrip.set_selected(i, True)
         self._sync_ui()
 
+    # ── Destination folder (session-scoped) ───────────────────────────────────
+
+    def _set_dest_folder(self):
+        name, ok = QInputDialog.getText(
+            self, "Cartella di destinazione",
+            "Nome cartella (solo per questa sessione):\n"
+            f"Lascia vuoto per tornare al default  '{DEST_FOLDER}'",
+            text=self._dest_folder,
+        )
+        if not ok:
+            return
+        self._dest_folder = name.strip() or DEST_FOLDER
+        self._sync_ui()
+
     # ── Copy ──────────────────────────────────────────────────────────────────
 
     def _copy_selected(self):
         if not self.selected or self._folder is None:
             return
 
-        dest    = self._folder / DEST_FOLDER
+        dest    = self._folder / self._dest_folder
         dest.mkdir(exist_ok=True)
         ordered = sorted(self.selected)
 
@@ -1392,7 +1411,7 @@ class PhotoSelector(QMainWindow):
         if self._folder is None:
             return
 
-        sel_folder = self._folder / DEST_FOLDER
+        sel_folder = self._folder / self._dest_folder
         files = sorted(
             f for f in sel_folder.iterdir()
             if f.is_file() and f.suffix.lower() in IMAGE_EXTS
@@ -1401,7 +1420,7 @@ class PhotoSelector(QMainWindow):
         if not files:
             QMessageBox.information(
                 self, "Nessuna foto da condividere",
-                f"La cartella '{DEST_FOLDER}' è vuota o non esiste.\n"
+                f"La cartella '{self._dest_folder}' è vuota o non esiste.\n"
                 "Prima copia le foto selezionate con il pulsante  📋 Copia selezionate.",
             )
             return
@@ -1493,8 +1512,14 @@ class PhotoSelector(QMainWindow):
             self.btn_select.setText("☆  Seleziona  [Space]")
             self.btn_select.setStyleSheet("")
 
+        folder_label = (
+            f"→ {self._dest_folder}"
+            if self._dest_folder != DEST_FOLDER else ""
+        )
         self.btn_copy.setText(
-            f"📋  Copia selezionate  ({n_sel})" if n_sel else "📋  Copia selezionate"
+            f"📋  Copia{' ' + folder_label if folder_label else ''}  ({n_sel})"
+            if n_sel else
+            f"📋  Copia selezionate{' ' + folder_label if folder_label else ''}"
         )
 
         if cur:
