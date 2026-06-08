@@ -3,6 +3,8 @@ PhotoSelector — Photo viewer with one-key selection and batch copy.
 
   ← / →  or  A / D   navigate
   Space                select / deselect current photo
+  Space (hold 2 s)     move current photo to "Scartate" folder
+  Ctrl+Z               undo last discard (move back)
   I                    toggle info panel
   [ / ]                rotate left / right (saved to file automatically)
   +  /  -              zoom in / out
@@ -32,9 +34,10 @@ from PyQt5.QtWidgets import (
     QStyledItemDelegate, QListView, QStyle,
     QDialog, QLineEdit, QDialogButtonBox, QInputDialog,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF, QSize, QUrl
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QRectF, QPointF, QSize, QUrl,
+                          QTimer, QPropertyAnimation, pyqtProperty)
 from PyQt5.QtGui import (
-    QPixmap, QColor, QPainter, QFont, QBrush, QPen, QIcon,
+    QPixmap, QColor, QPainter, QPainterPath, QFont, QBrush, QPen, QIcon,
     QKeySequence, QDesktopServices,
 )
 
@@ -50,7 +53,8 @@ IMAGE_EXTS = frozenset({
     ".jpg", ".jpeg", ".png", ".bmp", ".gif",
     ".tiff", ".tif", ".webp",
 })
-DEST_FOLDER = "selezionate"
+DEST_FOLDER    = "Selezionate"
+DISCARD_FOLDER = "Scartate"
 THUMB_W, THUMB_H = 132, 90
 
 FILEMAIL_BASE  = "https://www.filemail.com"
@@ -622,6 +626,120 @@ class ImageView(QGraphicsView):
         self._item: QGraphicsPixmapItem | None = None
         self._zoom = 1.0
 
+        self._tint_strength = 0.0
+        self._snake_active  = False
+        self._snake_offset  = 0.0
+        self._snake_timer   = QTimer(self)
+        self._snake_timer.timeout.connect(self._snake_tick)
+
+    # ── Tint property (animated by QPropertyAnimation) ────────────────────────
+
+    @pyqtProperty(float)
+    def tintStrength(self) -> float:
+        return self._tint_strength
+
+    @tintStrength.setter
+    def tintStrength(self, v: float):
+        self._tint_strength = v
+        self.viewport().update()
+
+    # ── Snake border animation ─────────────────────────────────────────────────
+
+    def start_snake(self):
+        if not self._snake_active:
+            self._snake_offset = 0.0
+            self._snake_active = True
+        if not self._snake_timer.isActive():
+            self._snake_timer.start(16)
+
+    def stop_snake(self):
+        if self._snake_active:
+            self._snake_active = False
+            self._snake_timer.stop()
+            self.viewport().update()
+
+    def _snake_tick(self):
+        self._snake_offset += 0.75
+        self.viewport().update()
+
+    # ── Overlay drawing (tint + snake) ────────────────────────────────────────
+
+    def drawForeground(self, painter, rect):
+        has_tint  = self._tint_strength > 0.0
+        has_snake = self._snake_active
+        if not has_tint and not has_snake:
+            return
+
+        painter.save()
+        painter.resetTransform()
+        vp = self.viewport()
+        w, h = vp.width(), vp.height()
+
+        if has_tint:
+            painter.fillRect(0, 0, w, h,
+                             QColor(220, 20, 20, int(self._tint_strength * 170)))
+
+        if has_snake and self._item is not None:
+            PW     = 4.0
+            HEAD_R = 8.0
+            PAD    = 6      # padding around the actual photo edge
+
+            # Map the photo's scene bounding rect into viewport pixel coordinates
+            vp_rect = self.mapFromScene(
+                self._item.sceneBoundingRect()
+            ).boundingRect()
+
+            x  = vp_rect.x() - PAD
+            y  = vp_rect.y() - PAD
+            rw = vp_rect.width()  + 2 * PAD
+            rh = vp_rect.height() + 2 * PAD
+
+            perim_px = 2 * (rw + rh)
+            pu       = perim_px / PW
+
+            snake_pu     = pu * 0.16
+            gap_pu       = pu * 0.5 - snake_pu
+            snake_len_px = snake_pu * PW
+
+            # Continuous path so the dash flows smoothly around all corners
+            path = QPainterPath()
+            path.moveTo(x,        y)
+            path.lineTo(x + rw,   y)
+            path.lineTo(x + rw,   y + rh)
+            path.lineTo(x,        y + rh)
+            path.lineTo(x,        y)
+
+            pen = QPen(QColor(50, 220, 100), PW)
+            pen.setStyle(Qt.CustomDashLine)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setDashPattern([snake_pu, gap_pu])
+            pen.setDashOffset(-(self._snake_offset % (pu * 0.5)))
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(path)
+
+            # Head circle at the leading edge of each snake
+            tail_px = (self._snake_offset * PW) % perim_px
+
+            def pt_on_rect(dist_px):
+                d = dist_px % perim_px
+                if d <= rw:  return QPointF(x + d,       y)
+                d -= rw
+                if d <= rh:  return QPointF(x + rw,      y + d)
+                d -= rh
+                if d <= rw:  return QPointF(x + rw - d,  y + rh)
+                d -= rw
+                return            QPointF(x,             y + rh - d)
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(80, 255, 130))
+            for phase in (0.0, perim_px * 0.5):
+                head_px = (tail_px + snake_len_px + phase) % perim_px
+                painter.drawEllipse(pt_on_rect(head_px), HEAD_R, HEAD_R)
+
+        painter.restore()
+
     def load(self, pixmap: QPixmap):
         self._scene.clear()
         self._item = QGraphicsPixmapItem(pixmap)
@@ -951,9 +1069,23 @@ class PhotoSelector(QMainWindow):
         self._share_worker:   FilemailUploader | None  = None
         self._share_progress: QProgressDialog | None   = None
         self._dest_folder:    str                       = DEST_FOLDER
+        self._discard_history: list[tuple[Path, Path, int]] = []
+        self._space_press_idx: int = -1
+        self._current_location: str = ""
+
+        self._space_timer = QTimer(self)
+        self._space_timer.setSingleShot(True)
+        self._space_timer.setInterval(2000)
+        self._space_timer.timeout.connect(self._discard_current)
 
         self._build_ui()
         self._connect()
+
+        self._tint_anim = QPropertyAnimation(self.image_view, b"tintStrength")
+        self._tint_anim.setDuration(2000)
+        self._tint_anim.setStartValue(0.0)
+        self._tint_anim.setEndValue(1.0)
+
         self._sync_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -1137,7 +1269,13 @@ class PhotoSelector(QMainWindow):
     def keyPressEvent(self, event):
         k = event.key()
         if k == Qt.Key_Space:
-            self._toggle_select()
+            if not event.isAutoRepeat() and self.current_index >= 0:
+                self._space_press_idx = self.current_index
+                self._space_timer.start()
+                self._tint_anim.start()
+                self.status.showMessage(
+                    "  Tieni premuto Spazio per 2 secondi per spostare in Scartate..."
+                )
         elif k in (Qt.Key_Right, Qt.Key_D):
             self._next()
         elif k in (Qt.Key_Left, Qt.Key_A):
@@ -1155,8 +1293,21 @@ class PhotoSelector(QMainWindow):
             self.image_view.zoom_out()
         elif k == Qt.Key_0:
             self.image_view.zoom_reset()
+        elif k == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
+            self._undo_discard()
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            if self._space_timer.isActive():
+                self._space_timer.stop()
+                self._tint_anim.stop()
+                self.image_view.tintStrength = 0.0
+                self._toggle_select()
+            # timer already fired → discard already happened, do nothing
+        else:
+            super().keyReleaseEvent(event)
 
     # ── Info panel toggle ─────────────────────────────────────────────────────
 
@@ -1223,6 +1374,7 @@ class PhotoSelector(QMainWindow):
     def _go_to(self, index: int):
         if not self.photos or not (0 <= index < len(self.photos)):
             return
+        self._current_location = ""
         self.current_index = index
         self.filmstrip.set_current(index)
         self._sync_ui()
@@ -1278,6 +1430,16 @@ class PhotoSelector(QMainWindow):
     def _on_geo_ready(self, index: int, location: str):
         if index == self.current_index:
             self.info_panel.set_location(location)
+            self._current_location = location
+            self.lbl_name.setText(self._name_with_location())
+
+    def _name_with_location(self) -> str:
+        if self.current_index < 0:
+            return ""
+        name = self.photos[self.current_index].name
+        if self._current_location:
+            return f"{name}   ·   {self._current_location}"
+        return name
 
     # ── Selection ─────────────────────────────────────────────────────────────
 
@@ -1330,6 +1492,113 @@ class PhotoSelector(QMainWindow):
             self.selected.add(i)
             self.filmstrip.set_selected(i, True)
         self._sync_ui()
+
+    # ── Discard (move to Scartate) ────────────────────────────────────────────
+
+    def _discard_current(self):
+        self._tint_anim.stop()
+        self.image_view.tintStrength = 0.0
+        if self.current_index < 0 or self._folder is None:
+            return
+
+        idx = self.current_index
+        src = self.photos[idx]
+
+        discard_dir = self._folder / DISCARD_FOLDER
+        discard_dir.mkdir(exist_ok=True)
+
+        dest = discard_dir / src.name
+        if dest.exists():
+            counter = 2
+            while dest.exists():
+                dest = discard_dir / f"{src.stem}_{counter}{src.suffix}"
+                counter += 1
+
+        try:
+            shutil.move(str(src), str(dest))
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile spostare la foto:\n{e}")
+            return
+
+        self._discard_history.append((src, dest, idx))
+
+        # Update selected indices: remove idx, shift indices above it down by 1
+        self.selected.discard(idx)
+        self.selected = {i - 1 if i > idx else i for i in self.selected}
+        self.filmstrip._selected.discard(idx)
+        self.filmstrip._selected = {i - 1 if i > idx else i for i in self.filmstrip._selected}
+
+        # Remove from filmstrip and photos list
+        self.filmstrip.blockSignals(True)
+        self.filmstrip.takeItem(idx)
+        self.filmstrip.blockSignals(False)
+        self.photos.pop(idx)
+
+        if not self.photos:
+            self.current_index = -1
+            self.image_view.show_placeholder("Nessuna foto rimanente")
+            self._sync_ui()
+            self.status.showMessage(
+                f"  '{src.name}' spostata in '{DISCARD_FOLDER}'  •  Ctrl+Z per annullare"
+            )
+            return
+
+        # Stay on same position (or last photo if we were at the end)
+        new_idx = min(idx, len(self.photos) - 1)
+        self.current_index = -1  # force _go_to to reload
+        self._go_to(new_idx)
+        self.status.showMessage(
+            f"  '{src.name}' spostata in '{DISCARD_FOLDER}'  •  Ctrl+Z per annullare"
+        )
+
+    def _undo_discard(self):
+        if not self._discard_history:
+            self.status.showMessage("  Nessuna azione da annullare")
+            return
+
+        original_path, discard_path, original_idx = self._discard_history.pop()
+
+        if not discard_path.exists():
+            QMessageBox.warning(
+                self, "Annulla",
+                f"Il file non esiste più:\n{discard_path.name}",
+            )
+            return
+
+        dest = original_path
+        if dest.exists():
+            counter = 2
+            while dest.exists():
+                dest = original_path.parent / f"{original_path.stem}_{counter}{original_path.suffix}"
+                counter += 1
+
+        try:
+            shutil.move(str(discard_path), str(dest))
+        except Exception as e:
+            QMessageBox.warning(self, "Errore annulla", f"Impossibile ripristinare la foto:\n{e}")
+            self._discard_history.append((original_path, discard_path, original_idx))
+            return
+
+        insert_idx = min(original_idx, len(self.photos))
+        self.photos.insert(insert_idx, dest)
+
+        # Shift selected indices at or above insert_idx up by 1
+        self.selected = {i + 1 if i >= insert_idx else i for i in self.selected}
+        self.filmstrip._selected = {i + 1 if i >= insert_idx else i for i in self.filmstrip._selected}
+
+        # Insert placeholder item in filmstrip, then load its thumbnail
+        self.filmstrip.blockSignals(True)
+        new_item = QListWidgetItem()
+        new_item.setSizeHint(QSize(THUMB_W + 8, THUMB_H + 8))
+        self.filmstrip.insertItem(insert_idx, new_item)
+        self.filmstrip.blockSignals(False)
+
+        self._undo_loader = ThumbnailLoader([dest])
+        self._undo_loader.ready.connect(lambda _, px: self.filmstrip.set_thumbnail(insert_idx, px))
+        self._undo_loader.start()
+
+        self._go_to(insert_idx)
+        self.status.showMessage(f"  '{dest.name}' ripristinata")
 
     # ── Destination folder (session-scoped) ───────────────────────────────────
 
@@ -1500,17 +1769,22 @@ class PhotoSelector(QMainWindow):
 
         if cur:
             self.lbl_counter.setText(f"{self.current_index + 1} / {len(self.photos)}")
-            self.lbl_name.setText(self.photos[self.current_index].name)
+            self.lbl_name.setText(self._name_with_location())
             is_sel = self.current_index in self.selected
             self.btn_select.setText(
                 "★  Selezionata  [Space]" if is_sel else "☆  Seleziona  [Space]"
             )
             self.btn_select.setStyleSheet(SELECT_ACTIVE_STYLE if is_sel else "")
+            if is_sel:
+                self.image_view.start_snake()
+            else:
+                self.image_view.stop_snake()
         else:
             self.lbl_counter.setText("—")
             self.lbl_name.setText("")
             self.btn_select.setText("☆  Seleziona  [Space]")
             self.btn_select.setStyleSheet("")
+            self.image_view.stop_snake()
 
         folder_label = (
             f"→ {self._dest_folder}"
