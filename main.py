@@ -623,6 +623,7 @@ class ImageView(QGraphicsView):
         self.setStyleSheet("background: #1a1a1a; border: none;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFocusPolicy(Qt.NoFocus)
         self._item: QGraphicsPixmapItem | None = None
         self._zoom = 1.0
 
@@ -1179,6 +1180,8 @@ class PhotoSelector(QMainWindow):
                   _vsep(), self.btn_info,
                   _vsep(), self.btn_rot_left, self.btn_rot_right,
                   _vsep(), self.btn_zout, self.btn_zreset, self.btn_zin]:
+            if isinstance(w, QPushButton):
+                w.setFocusPolicy(Qt.NoFocus)
             row.addWidget(w)
 
         # ── Thumbnail loading progress bar (hidden until loading starts) ──────
@@ -1205,6 +1208,7 @@ class PhotoSelector(QMainWindow):
         self.btn_img_prev = QPushButton("‹")
         self.btn_img_prev.setFixedSize(46, 100)
         self.btn_img_prev.setStyleSheet(NAV_ARROW_STYLE)
+        self.btn_img_prev.setFocusPolicy(Qt.NoFocus)
 
         self.image_view = ImageView()
         self.image_view.show_placeholder("Apri una cartella per iniziare  —  Ctrl+O")
@@ -1212,6 +1216,7 @@ class PhotoSelector(QMainWindow):
         self.btn_img_next = QPushButton("›")
         self.btn_img_next.setFixedSize(46, 100)
         self.btn_img_next.setStyleSheet(NAV_ARROW_STYLE)
+        self.btn_img_next.setFocusPolicy(Qt.NoFocus)
 
         img_row.addWidget(self.btn_img_prev)
         img_row.addWidget(self.image_view, 1)
@@ -1355,6 +1360,7 @@ class PhotoSelector(QMainWindow):
         self._thumb_loader.start()
 
         self._go_to(0)
+        self.setFocus()
 
     def _on_thumb_progress(self, n: int):
         self.progress_bar.setValue(n)
