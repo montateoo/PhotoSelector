@@ -15,10 +15,19 @@ from __future__ import annotations
 
 import json
 import sys
+import os
+import time
 import shutil
 import datetime
+import platform
+import logging
+import hashlib
+import traceback
+import faulthandler
 import urllib.request
 import urllib.parse
+import urllib.error
+import tomllib
 from pathlib import Path
 
 from PIL import Image as PilImage, ImageOps as PilImageOps
@@ -29,15 +38,18 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QFileDialog, QScrollArea,
     QSizePolicy, QStatusBar, QFrame, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
-    QProgressDialog, QProgressBar,
+    QProgressDialog, QProgressBar, QSlider,
     QListWidget, QListWidgetItem, QAbstractItemView,
     QStyledItemDelegate, QListView, QStyle,
     QDialog, QLineEdit, QDialogButtonBox, QInputDialog,
 )
-from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QRectF, QPointF, QSize, QUrl,
-                          QTimer, QPropertyAnimation, pyqtProperty)
+
+import cv2 as _cv2
+import numpy as _np
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QRect, QRectF, QPoint, QPointF,
+                          QSize, QUrl, QTimer, QPropertyAnimation, pyqtProperty)
 from PyQt5.QtGui import (
-    QPixmap, QColor, QPainter, QPainterPath, QFont, QBrush, QPen, QIcon,
+    QPixmap, QImage, QColor, QPainter, QPainterPath, QFont, QBrush, QPen, QIcon,
     QKeySequence, QDesktopServices,
 )
 
@@ -46,6 +58,19 @@ from PyQt5.QtGui import (
 def resource_path(name: str) -> str:
     base = getattr(sys, "_MEIPASS", Path(__file__).parent)
     return str(Path(base) / name)
+
+
+def _load_gh_token() -> str | None:
+    """Reads secrets.toml (gitignored, bundled into the exe at build time)."""
+    try:
+        with open(resource_path("secrets.toml"), "rb") as f:
+            data = tomllib.load(f)
+        return data.get("github", {}).get("token") or None
+    except Exception:
+        return None
+
+
+GH_TOKEN = _load_gh_token()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -71,6 +96,151 @@ def _load_settings() -> dict:
 
 def _save_settings(data: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+# ── Crash logging + GitHub auto-reporting ─────────────────────────────────────
+
+GH_OWNER = "montateoo"
+GH_REPO  = "PhotoSelector"
+
+_APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "PhotoSelector"
+_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+_CRASH_FAULT_PATH = _APP_DATA_DIR / "crash_native.log"
+_APP_LOG_PATH     = _APP_DATA_DIR / "app.log"
+_STATE_PATH       = _APP_DATA_DIR / "session_state.json"
+_THROTTLE_PATH    = _APP_DATA_DIR / "reported_signatures.json"
+
+_fault_fp = open(_CRASH_FAULT_PATH, "a", encoding="utf-8")
+faulthandler.enable(_fault_fp)
+
+logging.basicConfig(
+    filename=str(_APP_LOG_PATH),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("PhotoSelector")
+
+_session_state = {"action": "starting", "detail": "", "photos": 0}
+
+
+def _set_action(action: str, detail: str = "", photos: int | None = None) -> None:
+    """Records a breadcrumb of what the app was doing, for crash context."""
+    _session_state["action"] = action
+    _session_state["detail"] = detail
+    if photos is not None:
+        _session_state["photos"] = photos
+    try:
+        _STATE_PATH.write_text(json.dumps({
+            **_session_state, "clean_exit": False, "ts": time.time(),
+        }), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _mark_clean_exit() -> None:
+    try:
+        data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        data["clean_exit"] = True
+        _STATE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _system_info_text() -> str:
+    return (
+        f"OS: {platform.platform()}\n"
+        f"Python: {platform.python_version()}\n"
+        f"OpenCV: {_cv2.__version__}\n"
+    )
+
+
+def _already_reported_recently(signature: str) -> bool:
+    """Avoid spamming the issue tracker if the same crash repeats in a loop."""
+    try:
+        data = json.loads(_THROTTLE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    last = data.get(signature)
+    recent = bool(last and (time.time() - last) < 24 * 3600)
+    data[signature] = time.time()
+    try:
+        _THROTTLE_PATH.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+    return recent
+
+
+def _report_crash_to_github(title: str, body: str, signature: str) -> None:
+    log.error(f"{title}\n{body}")
+    if not GH_TOKEN:
+        log.warning("No GitHub token bundled — crash logged locally only")
+        return
+    if _already_reported_recently(signature):
+        log.info("Same crash signature reported in the last 24h — skipping upload")
+        return
+    try:
+        url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/issues"
+        payload = json.dumps({"title": title, "body": body, "labels": ["crash"]}).encode()
+        req = urllib.request.Request(url, data=payload, method="POST", headers={
+            "Authorization": f"Bearer {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "PhotoSelector-CrashReporter",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            log.info(f"GitHub issue created (status={resp.status})")
+    except Exception as e:
+        log.error(f"Failed to upload crash report to GitHub: {e}")
+
+
+def _format_crash_report(exc_type, exc_value, exc_tb) -> tuple[str, str]:
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    title = f"[Crash] {exc_type.__name__}: {str(exc_value)[:80]}"
+    body = (
+        "### Crash automatico\n\n"
+        f"**Quando:** {datetime.datetime.now().isoformat(timespec='seconds')}\n"
+        f"**Azione in corso:** {_session_state.get('action')} — {_session_state.get('detail')}\n"
+        f"**Foto caricate:** {_session_state.get('photos')}\n\n"
+        f"**Sistema:**\n```\n{_system_info_text()}```\n\n"
+        f"**Traceback:**\n```\n{tb_text}```"
+    )
+    return title, body
+
+
+def _excepthook(exc_type, exc_value, exc_tb) -> None:
+    title, body = _format_crash_report(exc_type, exc_value, exc_tb)
+    signature = hashlib.sha1(f"{exc_type.__name__}:{_session_state.get('action')}"
+                             .encode()).hexdigest()[:12]
+    _report_crash_to_github(title, body, signature)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _excepthook
+
+
+def _check_previous_session_crash() -> None:
+    """Detects a process that died without a clean exit (native crash / OOM kill),
+    which never reaches _excepthook, and reports it retroactively on next launch."""
+    try:
+        if not _STATE_PATH.exists():
+            return
+        data = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        if data.get("clean_exit", True):
+            return
+        title = "[Crash] Uscita anomala (possibile crash nativo o memoria insufficiente)"
+        body = (
+            "### Uscita anomala rilevata al lancio successivo\n\n"
+            "L'app non si è chiusa correttamente nella sessione precedente "
+            "(nessuna eccezione Python intercettata — probabile crash nativo o OOM).\n\n"
+            f"**Ultima azione registrata:** {data.get('action')} — {data.get('detail')}\n"
+            f"**Foto caricate:** {data.get('photos')}\n"
+            f"**Timestamp ultima azione:** "
+            f"{datetime.datetime.fromtimestamp(data.get('ts', 0)).isoformat(timespec='seconds')}\n\n"
+            f"**Sistema:**\n```\n{_system_info_text()}```"
+        )
+        signature = hashlib.sha1(f"abnormal_exit:{data.get('action')}".encode()).hexdigest()[:12]
+        _report_crash_to_github(title, body, signature)
+    except Exception as e:
+        log.error(f"Failed to check previous session state: {e}")
 
 # ── Stylesheets ───────────────────────────────────────────────────────────────
 
@@ -169,6 +339,46 @@ QPushButton:pressed { background: #4e2e7a; }
 QPushButton:disabled { background: #2a1e40; color: #666; }
 """
 
+MATCH_STYLE = """
+QPushButton {
+    background: #7c3aed; color: #fff;
+    border: none; border-radius: 6px;
+    padding: 6px 14px; font-weight: bold;
+}
+QPushButton:hover   { background: #6d28d9; }
+QPushButton:pressed { background: #5b21b6; }
+QPushButton:disabled { background: #2a1040; color: #555; }
+"""
+
+# ── Orientation-aware image loading ───────────────────────────────────────────
+
+def _load_oriented_pixmap(path: Path, max_size: tuple[int, int] | None = None) -> QPixmap:
+    """Loads an image applying its EXIF orientation tag (QPixmap alone ignores it).
+
+    When max_size is given, uses PIL's JPEG draft mode to downscale during
+    decode instead of after — this keeps thumbnail generation for large photo
+    batches from spiking memory with full-resolution decodes.
+    """
+    try:
+        with PilImage.open(str(path)) as img:
+            if max_size is not None and img.format == "JPEG":
+                img.draft("RGB", max_size)
+            img = PilImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            if max_size is not None:
+                img.thumbnail(max_size, PilImage.LANCZOS)
+            w, h = img.size
+            data = img.tobytes("raw", img.mode)
+            fmt  = QImage.Format_RGBA8888 if img.mode == "RGBA" else QImage.Format_RGB888
+            stride = (4 if img.mode == "RGBA" else 3) * w
+            qimg = QImage(data, w, h, stride, fmt)
+            return QPixmap.fromImage(qimg.copy())
+    except Exception as e:
+        log.warning(f"Orientation-aware load failed for {path.name}: {e}")
+        return QPixmap(str(path))
+
+
 # ── EXIF utilities ────────────────────────────────────────────────────────────
 
 def _rational(v) -> float:
@@ -202,7 +412,12 @@ def read_photo_info(path: Path) -> dict:
             if not exif:
                 return info
 
-            for tag_id, val in exif.items():
+            # DateTimeOriginal, LensModel, FocalLength, FNumber, ExposureTime
+            # and ISO live in the Exif SubIFD (0x8769), not the top-level IFD0
+            # that exif.items() alone returns — merge both so nothing is missed.
+            merged = {**dict(exif), **exif.get_ifd(0x8769)}
+
+            for tag_id, val in merged.items():
                 tag = TAGS.get(tag_id, "")
                 if tag == "DateTimeOriginal":
                     try:
@@ -266,15 +481,21 @@ class ThumbnailLoader(QThread):
         self._active  = True
 
     def run(self):
+        n = len(self.photos)
         for i, path in enumerate(self.photos):
             if not self._active:
                 break
-            px = QPixmap(str(path))
-            if not px.isNull():
-                thumb = px.scaled(THUMB_W, THUMB_H,
-                                  Qt.KeepAspectRatio,
-                                  Qt.SmoothTransformation)
-                self.ready.emit(i, thumb)
+            if i % 25 == 0:
+                _set_action("generating_thumbnails", f"{i}/{n}", n)
+            try:
+                px = _load_oriented_pixmap(path, max_size=(THUMB_W * 2, THUMB_H * 2))
+                if not px.isNull():
+                    thumb = px.scaled(THUMB_W, THUMB_H,
+                                      Qt.KeepAspectRatio,
+                                      Qt.SmoothTransformation)
+                    self.ready.emit(i, thumb)
+            except Exception as e:
+                log.error(f"Thumbnail generation failed for {path.name}: {e}")
             self.progress.emit(i + 1)
 
     def stop(self):
@@ -290,7 +511,11 @@ class ImageLoader(QThread):
         self.path  = path
 
     def run(self):
-        self.ready.emit(self.index, QPixmap(str(self.path)))
+        try:
+            self.ready.emit(self.index, _load_oriented_pixmap(self.path))
+        except Exception as e:
+            log.error(f"Image load failed for {self.path.name}: {e}")
+            self.ready.emit(self.index, QPixmap())
 
 
 class ExifLoader(QThread):
@@ -489,17 +714,57 @@ class FilemailUploader(QThread):
                         "User-Agent":     "PhotoSelector/1.0",
                     },
                 )
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    resp.read()
+                self._send_chunk_with_retry(req, path.name, offset)
                 offset += len(chunk)
+
+        # Defensive check: a silently-truncated upload must not be reported as success
+        if offset != size:
+            raise RuntimeError(
+                f"Caricamento incompleto per {path.name}: "
+                f"inviati {offset} byte su {size}"
+            )
+
+    def _send_chunk_with_retry(self, req, filename: str, offset: int, attempts: int = 3):
+        """Uploads one chunk, validating the response and retrying transient failures.
+
+        Filemail's chunk endpoint can return HTTP 200 with an app-level error in
+        the JSON body; previously that body was discarded unread, so a failed
+        chunk silently passed and the file ended up corrupted on the recipient
+        side with no error shown to the user.
+        """
+        last_err: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            if self._stopped:
+                return
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    body = resp.read()
+                try:
+                    parsed = json.loads(body) if body else None
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and parsed.get("response") not in (None, "ok"):
+                    raise RuntimeError(parsed.get("errormessage", "errore sconosciuto"))
+                return  # success
+            except Exception as e:
+                last_err = e
+                if attempt < attempts:
+                    time.sleep(1.5 * attempt)
+        raise RuntimeError(
+            f"Caricamento del chunk fallito per {filename} (offset {offset}) "
+            f"dopo {attempts} tentativi: {last_err}"
+        )
 
 
 # ── Filmstrip delegate (paints each thumbnail cell) ───────────────────────────
 
 class ThumbDelegate(QStyledItemDelegate):
-    def __init__(self, selected: set[int], parent=None):
+    def __init__(self, selected: set[int], matches: set[int], parent=None):
         super().__init__(parent)
         self._selected = selected
+        self._matches  = matches
 
     def paint(self, painter, option, index):
         painter.save()
@@ -518,12 +783,19 @@ class ThumbDelegate(QStyledItemDelegate):
             y  = rect.y() + (rect.height() - px.height()) // 2
             painter.drawPixmap(x, y, px)
 
-        # Border: blue = current, green = selected
         is_current = bool(option.state & QStyle.State_Selected)
         is_sel     = row in self._selected
-        if is_current or is_sel:
-            color = QColor("#0078d4") if is_current else QColor("#00c878")
-            pen   = QPen(color, 3)
+        is_match   = row in self._matches
+
+        # Border: blue=current, green=selected, purple=match
+        if is_current or is_sel or is_match:
+            if is_current:
+                color = QColor("#0078d4")
+            elif is_sel:
+                color = QColor("#00c878")
+            else:
+                color = QColor("#a855f7")
+            pen = QPen(color, 3)
             pen.setJoinStyle(Qt.MiterJoin)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
@@ -541,6 +813,17 @@ class ThumbDelegate(QStyledItemDelegate):
             painter.drawLine(cx - 5, cy, cx - 1, cy + 4)
             painter.drawLine(cx - 1, cy + 4, cx + 5, cy - 3)
 
+        # Purple motorcycle badge for match photos
+        if is_match:
+            cx, cy, r = rect.left() + 15, rect.bottom() - 15, 11
+            painter.setBrush(QBrush(QColor("#a855f7")))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+            painter.setPen(QPen(Qt.white, 1.5))
+            f = QFont("Segoe UI", 7, QFont.Bold)
+            painter.setFont(f)
+            painter.drawText(cx - r, cy - r, r * 2, r * 2, Qt.AlignCenter, "M")
+
         painter.restore()
 
     def sizeHint(self, option, index):
@@ -554,7 +837,8 @@ class FilmStrip(QListWidget):
     def __init__(self):
         super().__init__()
         self._selected: set[int] = set()
-        self.setItemDelegate(ThumbDelegate(self._selected, self))
+        self._matches:  set[int] = set()
+        self.setItemDelegate(ThumbDelegate(self._selected, self._matches, self))
 
         self.setFlow(QListView.LeftToRight)
         self.setWrapping(False)
@@ -579,6 +863,7 @@ class FilmStrip(QListWidget):
 
     def populate(self, count: int):
         self._selected.clear()
+        self._matches.clear()
         self.clear()
         for _ in range(count):
             item = QListWidgetItem()
@@ -607,6 +892,414 @@ class FilmStrip(QListWidget):
         item = self.item(index)
         if item:
             self.update(self.indexFromItem(item))
+
+    def set_match(self, index: int, v: bool):
+        if v:
+            self._matches.add(index)
+        else:
+            self._matches.discard(index)
+        item = self.item(index)
+        if item:
+            self.update(self.indexFromItem(item))
+
+    def clear_matches(self):
+        self._matches.clear()
+        self.viewport().update()
+
+# ── Bike / vest search helpers ────────────────────────────────────────────────
+
+def _make_hist(hsv_region) -> '_np.ndarray':
+    h = _cv2.calcHist([hsv_region], [0, 1], None, [36, 32], [0, 180, 0, 256])
+    _cv2.normalize(h, h, 0, 1, _cv2.NORM_MINMAX)
+    return h
+
+
+def _extract_hists(img_bgr) -> dict:
+    """Weighted 3-zone histograms used when no crop is specified."""
+    h, w = img_bgr.shape[:2]
+    hsv  = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
+    return {
+        'full':  _make_hist(hsv),
+        'bike':  _make_hist(hsv[int(h * 0.55):] or hsv),
+        'torso': _make_hist(hsv[int(h * 0.20):int(h * 0.75),
+                                int(w * 0.15):int(w * 0.85)] or hsv),
+    }
+
+
+def _hist_from_crop(img_bgr, crop: 'QRect') -> '_np.ndarray':
+    """Extract a single histogram from a QRect crop of img_bgr."""
+    ih, iw = img_bgr.shape[:2]
+    x  = max(0, min(crop.x(), iw - 1))
+    y  = max(0, min(crop.y(), ih - 1))
+    cw = min(crop.width(),  iw - x)
+    ch = min(crop.height(), ih - y)
+    region = img_bgr[y:y + ch, x:x + cw]
+    if region.size == 0:
+        region = img_bgr
+    return _make_hist(_cv2.cvtColor(region, _cv2.COLOR_BGR2HSV))
+
+
+def _best_zone_score(img_bgr, ref_hist) -> float:
+    """Max correlation of ref_hist against a 3×3 grid + full-image zones."""
+    ih, iw = img_bgr.shape[:2]
+    hsv = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2HSV)
+    best = 0.0
+    best = max(best, float(_cv2.compareHist(ref_hist, _make_hist(hsv),
+                                            _cv2.HISTCMP_CORREL)))
+    for r in range(3):
+        for c in range(3):
+            zone = hsv[ih * r // 3: ih * (r + 1) // 3,
+                       iw * c // 3: iw * (c + 1) // 3]
+            if zone.size == 0:
+                continue
+            best = max(best, float(_cv2.compareHist(ref_hist, _make_hist(zone),
+                                                    _cv2.HISTCMP_CORREL)))
+    return best
+
+
+def _crop_match_score(img_bgr, templates: list, ref_hist) -> float:
+    """Multi-scale template matching + histogram for crop-mode search.
+
+    Scales the template to 7 sizes and slides it over the candidate image.
+    TM_CCOEFF_NORMED handles brightness/contrast variation across photos.
+    Combined with a histogram zone-score to reduce false positives from
+    visually similar textures with very different colours.
+    """
+    # Resize candidate to max 1000px on longest side for speed
+    ih, iw = img_bgr.shape[:2]
+    if max(ih, iw) > 1000:
+        s = 1000 / max(ih, iw)
+        img_bgr = _cv2.resize(img_bgr, (int(iw * s), int(ih * s)))
+        ih, iw = img_bgr.shape[:2]
+
+    img_gray = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2GRAY)
+
+    best_tmpl = 0.0
+    for tmpl_bgr in templates:
+        th, tw = tmpl_bgr.shape[:2]
+        if th == 0 or tw == 0:
+            continue
+        # Cap template so it can fit inside the resized candidate
+        if max(th, tw) > 700:
+            ts = 700 / max(th, tw)
+            tmpl_bgr = _cv2.resize(tmpl_bgr, (int(tw * ts), int(th * ts)))
+            th, tw = tmpl_bgr.shape[:2]
+        tmpl_gray = _cv2.cvtColor(tmpl_bgr, _cv2.COLOR_BGR2GRAY)
+
+        for scale in (0.25, 0.4, 0.6, 0.8, 1.0, 1.3, 1.7):
+            tw_s = max(8, int(tw * scale))
+            th_s = max(8, int(th * scale))
+            if tw_s >= iw or th_s >= ih:
+                continue
+            try:
+                tmpl_s = _cv2.resize(tmpl_gray, (tw_s, th_s))
+                res = _cv2.matchTemplate(img_gray, tmpl_s, _cv2.TM_CCOEFF_NORMED)
+                _, mv, _, _ = _cv2.minMaxLoc(res)
+                best_tmpl = max(best_tmpl, float(mv))
+            except Exception:
+                pass
+
+    hist_score = _best_zone_score(img_bgr, ref_hist) if ref_hist is not None else 0.0
+    # Weight template heavily; histogram breaks ties on colour
+    return 0.70 * best_tmpl + 0.30 * max(0.0, hist_score)
+
+
+class BikeSearchWorker(QThread):
+    result   = pyqtSignal(int, float)
+    progress = pyqtSignal(int)
+
+    _WEIGHTS = {'full': 0.25, 'bike': 0.45, 'torso': 0.30}
+
+    def __init__(self, photos: list[Path], ref_hists: dict,
+                 crop_mode: bool = False, templates: list | None = None):
+        super().__init__()
+        self._photos    = photos
+        self._ref_hists = ref_hists
+        self._crop_mode = crop_mode
+        self._templates = templates or []
+        self._active    = True
+
+    def stop(self):
+        self._active = False
+
+    def run(self):
+        ref_crop = self._ref_hists.get('crop')
+        for i, path in enumerate(self._photos):
+            if not self._active:
+                break
+            try:
+                img = _cv2.imread(str(path))
+                if img is None:
+                    raise ValueError
+                if self._crop_mode:
+                    score = _crop_match_score(img, self._templates, ref_crop)
+                else:
+                    cand  = _extract_hists(img)
+                    score = sum(
+                        w * float(_cv2.compareHist(self._ref_hists[k], cand[k],
+                                                   _cv2.HISTCMP_CORREL))
+                        for k, w in self._WEIGHTS.items()
+                    )
+                self.result.emit(i, max(0.0, score))
+            except Exception:
+                self.result.emit(i, 0.0)
+            self.progress.emit(i + 1)
+
+
+# ── Crop selection widget + dialog ────────────────────────────────────────────
+
+class _CropCanvas(QWidget):
+    """Image widget that lets the user drag a crop rectangle."""
+    crop_changed = pyqtSignal(QRect)
+
+    def __init__(self, qimg: 'QImage', parent=None):
+        super().__init__(parent)
+        self._img      = qimg
+        self._start:   QPoint | None = None
+        self._cur:     QPoint | None = None
+        self._dragging = False
+        self.setCursor(Qt.CrossCursor)
+
+    def clear_selection(self):
+        self._start = self._cur = None
+        self._dragging = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._start    = e.pos()
+            self._cur      = e.pos()
+            self._dragging = True
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            self._cur = e.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._dragging:
+            self._cur      = e.pos()
+            self._dragging = False
+            r = self._sel()
+            if r is not None and r.width() > 8 and r.height() > 8:
+                self.crop_changed.emit(r)
+            self.update()
+
+    def _sel(self) -> 'QRect | None':
+        if self._start is None or self._cur is None:
+            return None
+        return QRect(self._start, self._cur).normalized()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.drawImage(0, 0, self._img)
+        r = self._sel()
+        if r:
+            w, h = self.width(), self.height()
+            dim = QColor(0, 0, 0, 130)
+            p.fillRect(0,        0,        w,        r.top(),              dim)
+            p.fillRect(0,        r.bottom(), w,       h - r.bottom(),      dim)
+            p.fillRect(0,        r.top(),   r.left(), r.height(),           dim)
+            p.fillRect(r.right(), r.top(),  w - r.right(), r.height(),      dim)
+            p.setPen(QPen(QColor(255, 70, 70), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(r)
+            # corner handles
+            p.setBrush(QColor(255, 70, 70))
+            for pt in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):
+                p.drawEllipse(pt, 4, 4)
+
+
+class CropDialog(QDialog):
+    """Shows a photo and lets the user drag a crop selection."""
+
+    def __init__(self, image_path: str, parent=None, img_bgr: '_np.ndarray | None' = None,
+                 title: str = "Seleziona area di riferimento",
+                 hint_text: str = "Trascina per isolare la moto o il giubbotto del club.\n"
+                                  "Lascia senza selezione per usare la foto intera."):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+
+        if img_bgr is not None:
+            img = img_bgr
+        else:
+            img = _cv2.imread(image_path)
+            if img is None:
+                img = _np.zeros((100, 100, 3), dtype=_np.uint8)
+        oh, ow = img.shape[:2]
+        self._scale = min(820 / ow, 640 / oh, 1.0)
+        dw, dh = int(ow * self._scale), int(oh * self._scale)
+
+        rgb   = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
+        qimg  = QImage(rgb.data, ow, oh, 3 * ow, QImage.Format_RGB888).scaled(
+            dw, dh, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self._crop: QRect | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        hint = QLabel(hint_text)
+        hint.setStyleSheet("color:#aaa; font-size:12px;")
+        lay.addWidget(hint)
+
+        self._canvas = _CropCanvas(qimg, self)
+        self._canvas.setFixedSize(dw, dh)
+        self._canvas.crop_changed.connect(self._on_crop)
+        lay.addWidget(self._canvas, alignment=Qt.AlignCenter)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        btn_clear = btns.addButton("Usa foto intera", QDialogButtonBox.ResetRole)
+        btn_clear.clicked.connect(self._clear)
+        btn_clear.setFocusPolicy(Qt.NoFocus)
+        lay.addWidget(btns)
+
+        self.adjustSize()
+
+    def _on_crop(self, rect: QRect):
+        s = 1.0 / self._scale
+        self._crop = QRect(int(rect.x() * s), int(rect.y() * s),
+                           int(rect.width() * s), int(rect.height() * s))
+
+    def _clear(self):
+        self._crop = None
+        self._canvas.clear_selection()
+
+    def crop_rect(self) -> 'QRect | None':
+        return self._crop
+
+
+class ReferencePickerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cerca moto / giubbotto del club")
+        self.setMinimumWidth(480)
+        # list of (path, crop_rect_or_None)
+        self._refs: list[tuple[str, 'QRect | None']] = []
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+
+        info = QLabel(
+            "Seleziona 1 o più foto di riferimento. Dopo ogni foto potrai\n"
+            "ritagliare l'area che mostra la moto o il giubbotto del club."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; font-size: 12px;")
+        lay.addWidget(info)
+
+        self._list = QListWidget()
+        self._list.setFixedHeight(120)
+        self._list.setStyleSheet(
+            "background:#2a2a2a; color:#ddd; border-radius:4px; padding:4px;"
+        )
+        self._list.setFocusPolicy(Qt.NoFocus)
+        lay.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("+ Aggiungi foto")
+        btn_add.setFocusPolicy(Qt.NoFocus)
+        btn_add.clicked.connect(self._add)
+        btn_crop = QPushButton("✂  Modifica ritaglio")
+        btn_crop.setFocusPolicy(Qt.NoFocus)
+        btn_crop.clicked.connect(self._edit_crop)
+        btn_rem = QPushButton("Rimuovi")
+        btn_rem.setFocusPolicy(Qt.NoFocus)
+        btn_rem.clicked.connect(self._remove)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_crop)
+        btn_row.addWidget(btn_rem)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        sens_row = QHBoxLayout()
+        sens_row.addWidget(QLabel("Sensibilità:"))
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setRange(25, 75)
+        self._slider.setValue(48)
+        self._slider.setFocusPolicy(Qt.NoFocus)
+        self._lbl_sens = QLabel("Media")
+        self._lbl_sens.setMinimumWidth(40)
+        self._lbl_sens.setStyleSheet("color:#aaa;")
+        self._slider.valueChanged.connect(self._update_sens_label)
+        sens_row.addWidget(self._slider)
+        sens_row.addWidget(self._lbl_sens)
+        lay.addLayout(sens_row)
+
+        hint = QLabel(
+            "Bassa = più risultati (possibili falsi positivi)\n"
+            "Alta  = solo corrispondenze strette"
+        )
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        lay.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        btns.button(QDialogButtonBox.Ok).setText("Avvia ricerca")
+        btns.button(QDialogButtonBox.Ok).setStyleSheet(MATCH_STYLE)
+        lay.addWidget(btns)
+
+    # ── label helper ──────────────────────────────────────────────────────────
+
+    def _item_label(self, path: str, crop: 'QRect | None') -> str:
+        name = Path(path).name
+        if crop:
+            return f"{name}  [ritaglio {crop.width()}×{crop.height()}]"
+        return f"{name}  [foto intera]"
+
+    # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _add(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Foto di riferimento", "",
+            "Immagini (*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.tif)",
+        )
+        for p in paths:
+            if any(r[0] == p for r in self._refs):
+                continue
+            crop_dlg = CropDialog(p, self)
+            crop_dlg.exec_()          # always opens; user can skip crop
+            crop = crop_dlg.crop_rect()
+            self._refs.append((p, crop))
+            self._list.addItem(self._item_label(p, crop))
+
+    def _edit_crop(self):
+        row = self._list.currentRow()
+        if row < 0:
+            return
+        path, _ = self._refs[row]
+        crop_dlg = CropDialog(path, self)
+        if crop_dlg.exec_() == QDialog.Accepted:
+            crop = crop_dlg.crop_rect()
+            self._refs[row] = (path, crop)
+            self._list.item(row).setText(self._item_label(path, crop))
+
+    def _remove(self):
+        row = self._list.currentRow()
+        if row >= 0:
+            self._list.takeItem(row)
+            self._refs.pop(row)
+
+    def _update_sens_label(self, v: int):
+        if v < 38:
+            self._lbl_sens.setText("Bassa")
+        elif v < 58:
+            self._lbl_sens.setText("Media")
+        else:
+            self._lbl_sens.setText("Alta")
+
+    def reference_refs(self) -> list[tuple[str, 'QRect | None']]:
+        return list(self._refs)
+
+    def threshold(self) -> float:
+        return self._slider.value() / 100.0
+
 
 # ── Image view ────────────────────────────────────────────────────────────────
 
@@ -1073,6 +1766,11 @@ class PhotoSelector(QMainWindow):
         self._discard_history: list[tuple[Path, Path, int]] = []
         self._space_press_idx: int = -1
         self._current_location: str = ""
+        self._bike_worker:     BikeSearchWorker | None = None
+        self._match_scores:    dict[int, float]        = {}
+        self._match_indices:   list[int]               = []
+        self._match_cursor:    int                     = -1
+        self._match_threshold: float                   = 0.48
 
         self._space_timer = QTimer(self)
         self._space_timer.setSingleShot(True)
@@ -1165,6 +1863,13 @@ class PhotoSelector(QMainWindow):
         self.btn_rot_right.setMinimumWidth(72)
         self.btn_rot_right.setToolTip("Ruota a destra  []]")
 
+        self.btn_crop = QPushButton("✂  Ritaglia")
+        self.btn_crop.setFixedHeight(36)
+        self.btn_crop.setToolTip(
+            "Ritaglia la foto corrente: il risultato viene salvato come\n"
+            "nuovo file accanto all'originale, senza modificarlo"
+        )
+
         self.btn_zout  = QPushButton("−")
         self.btn_zout.setFixedSize(36, 36)
         self.btn_zreset = QPushButton("⊡")
@@ -1173,13 +1878,45 @@ class PhotoSelector(QMainWindow):
         self.btn_zin   = QPushButton("+")
         self.btn_zin.setFixedSize(36, 36)
 
+        # ── Bike / vest search buttons ─────────────────────────────────────────
+        self.btn_bike_search = QPushButton("🏍  Cerca amico")
+        self.btn_bike_search.setFixedHeight(36)
+        self.btn_bike_search.setStyleSheet(MATCH_STYLE)
+        self.btn_bike_search.setToolTip(
+            "Trova foto simili in base alla moto e al giubbotto del club"
+        )
+
+        self.btn_match_prev = QPushButton("◀")
+        self.btn_match_prev.setFixedSize(28, 36)
+        self.btn_match_prev.setToolTip("Corrispondenza precedente")
+        self.btn_match_prev.setVisible(False)
+
+        self.btn_match_next = QPushButton("▶")
+        self.btn_match_next.setFixedSize(28, 36)
+        self.btn_match_next.setToolTip("Corrispondenza successiva")
+        self.btn_match_next.setVisible(False)
+
+        self.btn_match_clear = QPushButton("✕  Azzera")
+        self.btn_match_clear.setFixedHeight(36)
+        self.btn_match_clear.setToolTip("Cancella i risultati della ricerca")
+        self.btn_match_clear.setVisible(False)
+
+        self._match_progress = QProgressBar()
+        self._match_progress.setFixedHeight(18)
+        self._match_progress.setFixedWidth(90)
+        self._match_progress.setTextVisible(False)
+        self._match_progress.setVisible(False)
+
         for w in [self.btn_open,
                   _vsep(), self.btn_prev, self.lbl_counter, self.btn_next,
                   _vsep(), self.lbl_name,
                   _vsep(), self.btn_select, self.btn_copy, self.btn_share,
                   _vsep(), self.btn_info,
-                  _vsep(), self.btn_rot_left, self.btn_rot_right,
-                  _vsep(), self.btn_zout, self.btn_zreset, self.btn_zin]:
+                  _vsep(), self.btn_rot_left, self.btn_rot_right, self.btn_crop,
+                  _vsep(), self.btn_zout, self.btn_zreset, self.btn_zin,
+                  _vsep(), self.btn_bike_search,
+                  self.btn_match_prev, self.btn_match_next,
+                  self.btn_match_clear, self._match_progress]:
             if isinstance(w, QPushButton):
                 w.setFocusPolicy(Qt.NoFocus)
             row.addWidget(w)
@@ -1264,10 +2001,21 @@ class PhotoSelector(QMainWindow):
         self.btn_info.clicked.connect(self._toggle_info)
         self.btn_rot_left.clicked.connect(lambda: self._rotate(clockwise=False))
         self.btn_rot_right.clicked.connect(lambda: self._rotate(clockwise=True))
+        self.btn_crop.clicked.connect(self._crop_current)
         self.btn_zin.clicked.connect(self.image_view.zoom_in)
         self.btn_zout.clicked.connect(self.image_view.zoom_out)
         self.btn_zreset.clicked.connect(self.image_view.zoom_reset)
         self.filmstrip.navigate.connect(self._go_to)
+        self.btn_bike_search.clicked.connect(self._start_bike_search)
+        self.btn_match_prev.clicked.connect(self._match_prev)
+        self.btn_match_next.clicked.connect(self._match_next)
+        self.btn_match_clear.clicked.connect(self._clear_matches)
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        _mark_clean_exit()
+        super().closeEvent(event)
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
 
@@ -1336,6 +2084,8 @@ class PhotoSelector(QMainWindow):
         )
         self.selected.clear()
         self.current_index = -1
+
+        _set_action("opening_folder", self._folder.name, len(self.photos))
 
         if not self.photos:
             self.image_view.show_placeholder("Nessuna foto trovata in questa cartella")
@@ -1487,6 +2237,86 @@ class PhotoSelector(QMainWindow):
                             f"Impossibile ruotare la foto:\n{msg}")
         self._sync_ui()
 
+    # ── Crop (saved as a new file, original untouched) ─────────────────────────
+
+    def _crop_current(self):
+        if self.current_index < 0 or self._folder is None:
+            return
+        idx  = self.current_index
+        path = self.photos[idx]
+
+        try:
+            with PilImage.open(str(path)) as img:
+                exif = img.getexif()
+                exif.pop(274, None)          # Orientation — baked in by exif_transpose below
+                exif_bytes = exif.tobytes()
+                img = PilImageOps.exif_transpose(img)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                arr = _np.array(img)
+            img_bgr = _cv2.cvtColor(arr, _cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile aprire la foto:\n{e}")
+            return
+
+        dlg = CropDialog(
+            str(path), self, img_bgr=img_bgr,
+            title="Ritaglia foto",
+            hint_text="Trascina per selezionare l'area da ritagliare.\n"
+                      "Il ritaglio verrà salvato come nuovo file, senza modificare l'originale.",
+        )
+        if dlg.exec_() != QDialog.Accepted or dlg.crop_rect() is None:
+            return
+
+        crop = dlg.crop_rect()
+        ih, iw = img_bgr.shape[:2]
+        x  = max(0, min(crop.x(), iw - 1))
+        y  = max(0, min(crop.y(), ih - 1))
+        cw = min(crop.width(),  iw - x)
+        ch = min(crop.height(), ih - y)
+        if cw <= 0 or ch <= 0:
+            return
+
+        cropped_rgb = _cv2.cvtColor(img_bgr[y:y + ch, x:x + cw], _cv2.COLOR_BGR2RGB)
+        cropped_img = PilImage.fromarray(cropped_rgb)
+
+        new_path = path.parent / f"{path.stem}_crop{path.suffix}"
+        counter = 2
+        while new_path.exists():
+            new_path = path.parent / f"{path.stem}_crop_{counter}{path.suffix}"
+            counter += 1
+
+        try:
+            suffix = path.suffix.lower()
+            if suffix in (".jpg", ".jpeg"):
+                cropped_img.save(str(new_path), format="JPEG", quality=95,
+                                subsampling=0, exif=exif_bytes)
+            elif suffix == ".png":
+                cropped_img.save(str(new_path), format="PNG")
+            else:
+                cropped_img.save(str(new_path))
+        except Exception as e:
+            QMessageBox.warning(self, "Errore", f"Impossibile salvare il ritaglio:\n{e}")
+            return
+
+        insert_idx = idx + 1
+        self.photos.insert(insert_idx, new_path)
+        self.selected = {i + 1 if i >= insert_idx else i for i in self.selected}
+        self.filmstrip._selected = {i + 1 if i >= insert_idx else i for i in self.filmstrip._selected}
+
+        self.filmstrip.blockSignals(True)
+        new_item = QListWidgetItem()
+        new_item.setSizeHint(QSize(THUMB_W + 8, THUMB_H + 8))
+        self.filmstrip.insertItem(insert_idx, new_item)
+        self.filmstrip.blockSignals(False)
+
+        self._crop_loader = ThumbnailLoader([new_path])
+        self._crop_loader.ready.connect(lambda _, px: self.filmstrip.set_thumbnail(insert_idx, px))
+        self._crop_loader.start()
+
+        self._go_to(insert_idx)
+        self.status.showMessage(f"  Ritaglio salvato come '{new_path.name}'")
+
     def _toggle_select(self):
         if self.current_index < 0:
             return
@@ -1509,6 +2339,8 @@ class PhotoSelector(QMainWindow):
 
         idx = self.current_index
         src = self.photos[idx]
+
+        _set_action("discarding_photo", src.name, len(self.photos))
 
         discard_dir = self._folder / DISCARD_FOLDER
         discard_dir.mkdir(exist_ok=True)
@@ -1669,6 +2501,146 @@ class PhotoSelector(QMainWindow):
                 f"{copied} foto copiate in:\n{dest}",
             )
 
+    # ── Bike / vest search ────────────────────────────────────────────────────
+
+    def _start_bike_search(self):
+        if not self.photos:
+            return
+        if self._bike_worker and self._bike_worker.isRunning():
+            self._bike_worker.stop()
+            self._bike_worker.wait(500)
+
+        dlg = ReferencePickerDialog(self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.reference_refs():
+            return
+
+        refs = dlg.reference_refs()
+        self._match_threshold = dlg.threshold()
+
+        # Decide mode: any cropped ref → template matching mode
+        crop_mode  = any(crop is not None for _, crop in refs)
+        crop_hists = []
+        templates  = []
+        zone_hists: dict[str, list] = {'full': [], 'bike': [], 'torso': []}
+        valid = 0
+
+        for p, crop in refs:
+            img = _cv2.imread(p)
+            if img is None:
+                continue
+            valid += 1
+            if crop_mode:
+                if crop is not None:
+                    ih, iw = img.shape[:2]
+                    x  = max(0, min(crop.x(), iw - 1))
+                    y  = max(0, min(crop.y(), ih - 1))
+                    cw = min(crop.width(),  iw - x)
+                    ch = min(crop.height(), ih - y)
+                    tmpl = img[y:y + ch, x:x + cw]
+                    if tmpl.size > 0:
+                        templates.append(tmpl)
+                    crop_hists.append(_hist_from_crop(img, crop))
+                else:
+                    crop_hists.append(_make_hist(_cv2.cvtColor(img, _cv2.COLOR_BGR2HSV)))
+            else:
+                h = _extract_hists(img)
+                for k in zone_hists:
+                    zone_hists[k].append(h[k])
+
+        if valid == 0:
+            QMessageBox.warning(self, "Errore", "Nessuna foto di riferimento valida.")
+            return
+
+        def _avg(lst):
+            acc = lst[0].copy().astype(float)
+            for a in lst[1:]:
+                acc += a.astype(float)
+            return (acc / len(lst)).astype('float32')
+
+        if crop_mode:
+            avg_hists = {'crop': _avg(crop_hists)} if crop_hists else {}
+        else:
+            avg_hists = {k: _avg(v) for k, v in zone_hists.items() if v}
+
+        # Reset previous results
+        self._match_scores  = {}
+        self._match_indices = []
+        self._match_cursor  = -1
+        self.filmstrip.clear_matches()
+
+        n = len(self.photos)
+        self._match_progress.setMaximum(n)
+        self._match_progress.setValue(0)
+        self._match_progress.setVisible(True)
+        self.btn_match_clear.setVisible(False)
+        self.btn_match_prev.setVisible(False)
+        self.btn_match_next.setVisible(False)
+
+        self._bike_worker = BikeSearchWorker(
+            self.photos, avg_hists, crop_mode,
+            templates if crop_mode else None
+        )
+        self._bike_worker.result.connect(self._on_search_result)
+        self._bike_worker.progress.connect(self._on_search_progress)
+        self._bike_worker.finished.connect(self._on_search_done)
+        self._bike_worker.start()
+        self.setFocus()
+
+    def _on_search_result(self, idx: int, score: float):
+        if score >= self._match_threshold:
+            self._match_scores[idx] = score
+            self.filmstrip.set_match(idx, True)
+
+    def _on_search_progress(self, done: int):
+        self._match_progress.setValue(done)
+
+    def _on_search_done(self):
+        self._match_progress.setVisible(False)
+        self._match_indices = sorted(self._match_scores.keys())
+        n = len(self._match_indices)
+        if n == 0:
+            QMessageBox.information(
+                self, "Ricerca completata",
+                "Nessuna foto corrispondente trovata.\n"
+                "Prova ad abbassare la sensibilità."
+            )
+            return
+        self.btn_match_prev.setVisible(True)
+        self.btn_match_next.setVisible(True)
+        self.btn_match_clear.setVisible(True)
+        self.btn_match_clear.setText(f"✕  Azzera ({n})")
+        if self._match_indices:
+            self._match_cursor = 0
+            self._go_to(self._match_indices[0])
+        self.setFocus()
+
+    def _match_prev(self):
+        if not self._match_indices:
+            return
+        self._match_cursor = (self._match_cursor - 1) % len(self._match_indices)
+        self._go_to(self._match_indices[self._match_cursor])
+        self.setFocus()
+
+    def _match_next(self):
+        if not self._match_indices:
+            return
+        self._match_cursor = (self._match_cursor + 1) % len(self._match_indices)
+        self._go_to(self._match_indices[self._match_cursor])
+        self.setFocus()
+
+    def _clear_matches(self):
+        if self._bike_worker and self._bike_worker.isRunning():
+            self._bike_worker.stop()
+        self._match_scores  = {}
+        self._match_indices = []
+        self._match_cursor  = -1
+        self.filmstrip.clear_matches()
+        self.btn_match_prev.setVisible(False)
+        self.btn_match_next.setVisible(False)
+        self.btn_match_clear.setVisible(False)
+        self._match_progress.setVisible(False)
+        self.setFocus()
+
     # ── Filemail share ────────────────────────────────────────────────────────
 
     def _share_settings(self):
@@ -1767,9 +2739,11 @@ class PhotoSelector(QMainWindow):
         self.btn_info.setEnabled(cur)
         self.btn_copy.setEnabled(n_sel > 0)
         self.btn_share.setEnabled(self._folder is not None)
+        self.btn_bike_search.setEnabled(bool(self.photos))
         rotating = bool(self._rotate_worker and self._rotate_worker.isRunning())
         for btn in (self.btn_rot_left, self.btn_rot_right):
             btn.setEnabled(cur and not rotating)
+        self.btn_crop.setEnabled(cur and not rotating)
         for btn in (self.btn_zin, self.btn_zout, self.btn_zreset):
             btn.setEnabled(cur)
 
@@ -1813,6 +2787,8 @@ class PhotoSelector(QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _check_previous_session_crash()
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
