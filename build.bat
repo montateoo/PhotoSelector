@@ -18,8 +18,10 @@ pyinstaller ^
     --windowed ^
     --icon=icon.ico ^
     --add-data "icon.ico;." ^
+    --add-data "secrets.toml;." ^
     --name=PhotoSelector ^
     --hidden-import=PyQt5.sip ^
+    --collect-all PyQt5 ^
     main.py
 if errorlevel 1 ( echo ERROR: PyInstaller failed & pause & exit /b 1 )
 
