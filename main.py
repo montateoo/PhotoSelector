@@ -533,14 +533,17 @@ class RotateWorker(QThread):
     def run(self):
         try:
             with PilImage.open(str(self.path)) as img:
-                # Preserve EXIF but drop the orientation tag (we're baking it in)
                 exif = img.getexif()
+
+                # Apply any existing EXIF orientation FIRST so our rotation is
+                # relative to what the user actually sees on screen. Must run
+                # before popping the tag below — exif_transpose reads it from
+                # the same cached Exif object getexif() returned.
+                img = PilImageOps.exif_transpose(img)
+
+                # Drop the orientation tag now that it's baked into the pixels
                 exif.pop(274, None)          # 274 = Orientation
                 exif_bytes = exif.tobytes()
-
-                # Apply any existing EXIF orientation so our rotation is
-                # relative to what the user actually sees on screen
-                img = PilImageOps.exif_transpose(img)
 
                 # PIL rotates counter-clockwise, so clockwise → -90
                 rotated = img.rotate(-90 if self.clockwise else 90, expand=True)
@@ -862,6 +865,20 @@ class FilmStrip(QListWidget):
         if item:
             self.update(self.indexFromItem(item))
 
+    def reindex_selected(self, mapper):
+        """Recompute indices in-place (mapper: old_index -> new_index, or None to drop).
+
+        Must mutate self._selected rather than reassign it — ThumbDelegate was
+        handed a direct reference to this set at construction time, so a fresh
+        set here orphans the delegate from future updates (it keeps painting
+        stale state forever, even though FilmStrip's own set is correct).
+        """
+        new_indices = {mapper(i) for i in self._selected}
+        new_indices.discard(None)
+        self._selected.clear()
+        self._selected.update(new_indices)
+        self.viewport().update()
+
 # ── Crop selection widget + dialog ────────────────────────────────────────────
 
 class _CropCanvas(QWidget):
@@ -945,7 +962,11 @@ class CropDialog(QDialog):
             if img is None:
                 img = _np.zeros((100, 100, 3), dtype=_np.uint8)
         oh, ow = img.shape[:2]
-        self._scale = min(820 / ow, 640 / oh, 1.0)
+        screen = QApplication.primaryScreen()
+        avail  = screen.availableGeometry() if screen else None
+        max_w  = int(avail.width()  * 0.85) if avail else 1000
+        max_h  = int(avail.height() * 0.80) if avail else 750
+        self._scale = min(max_w / ow, max_h / oh, 1.0)
         dw, dh = int(ow * self._scale), int(oh * self._scale)
 
         rgb   = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
@@ -1896,9 +1917,12 @@ class PhotoSelector(QMainWindow):
         try:
             with PilImage.open(str(path)) as img:
                 exif = img.getexif()
-                exif.pop(274, None)          # Orientation — baked in by exif_transpose below
-                exif_bytes = exif.tobytes()
+                # Apply EXIF orientation FIRST — exif_transpose reads it from
+                # the same cached Exif object getexif() returned, so popping
+                # the tag beforehand would silently leave the image un-rotated.
                 img = PilImageOps.exif_transpose(img)
+                exif.pop(274, None)          # now safe: pixels already corrected
+                exif_bytes = exif.tobytes()
                 if img.mode != "RGB":
                     img = img.convert("RGB")
                 arr = _np.array(img)
@@ -1950,7 +1974,7 @@ class PhotoSelector(QMainWindow):
         insert_idx = idx + 1
         self.photos.insert(insert_idx, new_path)
         self.selected = {i + 1 if i >= insert_idx else i for i in self.selected}
-        self.filmstrip._selected = {i + 1 if i >= insert_idx else i for i in self.filmstrip._selected}
+        self.filmstrip.reindex_selected(lambda i: i + 1 if i >= insert_idx else i)
 
         self.filmstrip.blockSignals(True)
         new_item = QListWidgetItem()
@@ -2011,8 +2035,7 @@ class PhotoSelector(QMainWindow):
         # Update selected indices: remove idx, shift indices above it down by 1
         self.selected.discard(idx)
         self.selected = {i - 1 if i > idx else i for i in self.selected}
-        self.filmstrip._selected.discard(idx)
-        self.filmstrip._selected = {i - 1 if i > idx else i for i in self.filmstrip._selected}
+        self.filmstrip.reindex_selected(lambda i: None if i == idx else (i - 1 if i > idx else i))
 
         # Remove from filmstrip and photos list
         self.filmstrip.blockSignals(True)
@@ -2070,7 +2093,7 @@ class PhotoSelector(QMainWindow):
 
         # Shift selected indices at or above insert_idx up by 1
         self.selected = {i + 1 if i >= insert_idx else i for i in self.selected}
-        self.filmstrip._selected = {i + 1 if i >= insert_idx else i for i in self.filmstrip._selected}
+        self.filmstrip.reindex_selected(lambda i: i + 1 if i >= insert_idx else i)
 
         # Insert placeholder item in filmstrip, then load its thumbnail
         self.filmstrip.blockSignals(True)
