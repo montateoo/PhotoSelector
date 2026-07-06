@@ -98,7 +98,9 @@ def _load_settings() -> dict:
 
 
 def _save_settings(data: dict) -> None:
-    SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    current = _load_settings()
+    current.update(data)
+    SETTINGS_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
 # ── Crash logging + GitHub auto-reporting ─────────────────────────────────────
 
@@ -1532,6 +1534,16 @@ class PhotoSelector(QMainWindow):
         self._img_loader:     ImageLoader | None       = None
         self._exif_loader:    ExifLoader | None        = None
         self._geo_loader:     GeocoderThread | None    = None
+
+        # Debounce rapid arrow-key navigation: update the index immediately
+        # but only start the (expensive) image-load thread after the user
+        # pauses for 150 ms. Without this, holding an arrow key spawns a new
+        # ImageLoader thread for every keypress — each decoding a full-res
+        # JPEG — causing rapid memory exhaustion and an OOM crash.
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setSingleShot(True)
+        self._nav_timer.setInterval(150)
+        self._nav_timer.timeout.connect(self._load_current_image)
         self._rotate_worker:  RotateWorker | None      = None
         self._rotate_thumb_idx: int | None             = None  # needs thumb regen
         self._share_worker:   FilemailUploader | None  = None
@@ -1554,6 +1566,37 @@ class PhotoSelector(QMainWindow):
         self._tint_anim.setStartValue(0.0)
         self._tint_anim.setEndValue(1.0)
 
+        self._sync_ui()
+        self._restore_last_session()
+
+    # ── Session restore ───────────────────────────────────────────────────────
+
+    def _restore_last_session(self):
+        settings = _load_settings()
+        folder_str = settings.get("last_folder")
+        last_index = settings.get("last_index", 0)
+        if not folder_str:
+            return
+        folder = Path(folder_str)
+        if not folder.is_dir():
+            return
+        self._folder = folder
+        self.photos = sorted(
+            p for p in folder.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        )
+        if not self.photos:
+            return
+        self.filmstrip.populate(len(self.photos))
+        self.progress_bar.setMaximum(len(self.photos))
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self._thumb_loader = ThumbnailLoader(self.photos)
+        self._thumb_loader.ready.connect(self.filmstrip.set_thumbnail)
+        self._thumb_loader.progress.connect(self._on_thumb_progress)
+        self._thumb_loader.start()
+        _set_action("opening_folder", folder.name, len(self.photos))
+        self._go_to(min(last_index, len(self.photos) - 1))
         self._sync_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -1868,20 +1911,37 @@ class PhotoSelector(QMainWindow):
         self.filmstrip.set_current(index)
         self._sync_ui()
 
-        # Load full image
+        # Cancel any in-flight loaders from a previous navigation.
         if self._img_loader and self._img_loader.isRunning():
             self._img_loader.quit()
+        if self._exif_loader and self._exif_loader.isRunning():
+            self._exif_loader.quit()
+        self.info_panel.clear()
+
+        # Restart the debounce timer. If another _go_to fires within 150 ms
+        # (e.g. held arrow key) the timer resets and no thread is started yet.
+        self._nav_timer.start()
+
+    def _load_current_image(self):
+        """Called by _nav_timer after 150 ms of idle navigation."""
+        index = self.current_index
+        if not self.photos or not (0 <= index < len(self.photos)):
+            return
+
         self._img_loader = ImageLoader(index, self.photos[index])
         self._img_loader.ready.connect(self._on_image_ready)
         self._img_loader.start()
 
-        # Load EXIF (always, so info panel is ready when opened)
-        if self._exif_loader and self._exif_loader.isRunning():
-            self._exif_loader.quit()
-        self.info_panel.clear()
         self._exif_loader = ExifLoader(index, self.photos[index])
         self._exif_loader.ready.connect(self._on_exif_ready)
         self._exif_loader.start()
+
+        # Persist position so the next session (or post-crash reopen) resumes here.
+        if self._folder:
+            _save_settings({
+                "last_folder": str(self._folder),
+                "last_index":  index,
+            })
 
     def _on_image_ready(self, index: int, px: QPixmap):
         if index != self.current_index:
