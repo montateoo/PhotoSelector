@@ -480,12 +480,16 @@ class ThumbnailLoader(QThread):
         self._active  = True
 
     def run(self):
+        import gc
         n = len(self.photos)
         for i, path in enumerate(self.photos):
             if not self._active:
                 break
-            if i % 25 == 0:
+            if i % 10 == 0:
                 _set_action("generating_thumbnails", f"{i}/{n}", n)
+                gc.collect()          # release accumulated PIL/Qt memory
+                if i > 0:
+                    self.msleep(5)    # let the main thread drain queued signals
             try:
                 px = _load_oriented_pixmap(path, max_size=(THUMB_W * 2, THUMB_H * 2))
                 if not px.isNull():
@@ -493,6 +497,9 @@ class ThumbnailLoader(QThread):
                                       Qt.KeepAspectRatio,
                                       Qt.SmoothTransformation)
                     self.ready.emit(i, thumb)
+                del px
+            except MemoryError:
+                log.error(f"Out of memory generating thumbnail for {path.name} — skipping")
             except Exception as e:
                 log.error(f"Thumbnail generation failed for {path.name}: {e}")
             self.progress.emit(i + 1)
