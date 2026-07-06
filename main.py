@@ -117,11 +117,15 @@ _THROTTLE_PATH    = _APP_DATA_DIR / "reported_signatures.json"
 _fault_fp = open(_CRASH_FAULT_PATH, "a", encoding="utf-8")
 faulthandler.enable(_fault_fp)
 
-logging.basicConfig(
-    filename=str(_APP_LOG_PATH),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+class _FlushHandler(logging.FileHandler):
+    """FileHandler that flushes after every record so entries survive hard crashes."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+_log_handler = _FlushHandler(str(_APP_LOG_PATH), encoding="utf-8")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(handlers=[_log_handler], level=logging.INFO)
 log = logging.getLogger("PhotoSelector")
 
 _session_state = {"action": "starting", "detail": "", "photos": 0}
@@ -134,9 +138,10 @@ def _set_action(action: str, detail: str = "", photos: int | None = None) -> Non
     if photos is not None:
         _session_state["photos"] = photos
     try:
-        _STATE_PATH.write_text(json.dumps({
-            **_session_state, "clean_exit": False, "ts": time.time(),
-        }), encoding="utf-8")
+        payload = json.dumps({**_session_state, "clean_exit": False, "ts": time.time()})
+        tmp = _STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_STATE_PATH)   # atomic on same filesystem
     except Exception:
         pass
 
@@ -1573,6 +1578,12 @@ class PhotoSelector(QMainWindow):
 
     def _restore_last_session(self):
         settings = _load_settings()
+
+        # Restore info panel open/closed state before loading any folder.
+        if settings.get("info_panel_open", False):
+            self.btn_info.setChecked(True)
+            self._toggle_info()
+
         folder_str = settings.get("last_folder")
         last_index = settings.get("last_index", 0)
         if not folder_str:
@@ -1845,6 +1856,7 @@ class PhotoSelector(QMainWindow):
         self.info_panel.setVisible(visible)
         self._info_divider.setVisible(visible)
         self.btn_info.setStyleSheet(INFO_ACTIVE_STYLE if visible else "")
+        _save_settings({"info_panel_open": visible})
 
     # ── Folder loading ────────────────────────────────────────────────────────
 
@@ -1910,6 +1922,7 @@ class PhotoSelector(QMainWindow):
         self.current_index = index
         self.filmstrip.set_current(index)
         self._sync_ui()
+        _set_action("navigating", self.photos[index].name)
 
         # Cancel any in-flight loaders from a previous navigation.
         if self._img_loader and self._img_loader.isRunning():
