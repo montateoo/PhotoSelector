@@ -83,7 +83,10 @@ DISCARD_FOLDER = "Scartate"
 THUMB_W, THUMB_H = 132, 90
 
 FILEMAIL_BASE  = "https://www.filemail.com"
-FILEMAIL_CHUNK = 10 * 1024 * 1024          # 10 MB per chunk
+# Filemail recommends chunks of 5–50 MB (for files >50 MB). Photos here are
+# <10 MB, so a 25 MB chunk means every photo is sent in a single HTTP request —
+# no server-side chunk assembly, no partial-file corruption risk.
+FILEMAIL_CHUNK = 25 * 1024 * 1024
 SETTINGS_PATH  = Path.home() / ".photoselector_settings.json"
 
 
@@ -600,6 +603,7 @@ class FilemailUploader(QThread):
     """Uploads a list of files to Filemail and emits the download URL."""
     progress = pyqtSignal(int, int)   # (files_done, files_total)
     done     = pyqtSignal(str)        # shareable download URL
+    warning  = pyqtSignal(str)        # non-fatal: some files failed but others succeeded
     error    = pyqtSignal(str)
 
     def __init__(self, files: list, from_email: str, api_key: str = ""):
@@ -613,6 +617,8 @@ class FilemailUploader(QThread):
         self._stopped = True
 
     def run(self):
+        failed: list[str] = []
+        uploaded = 0
         try:
             # 1. Initialize transfer
             params: dict = {
@@ -642,19 +648,55 @@ class FilemailUploader(QThread):
                     data.get("errormessage", "Errore inizializzazione trasferimento")
                 )
 
-            t      = data.get("transfer", data)
-            tid    = t["transferid"]
-            tkey   = t["transferkey"]
-            turl   = t["transferurl"]
+            t    = data.get("transfer", data)
+            tid  = t["transferid"]
+            tkey = t["transferkey"]
+            turl = t["transferurl"]
 
-            # 2. Upload files one by one (chunked for large files)
+            # 2. Upload files one by one — per-file errors are isolated so a
+            #    single bad file cannot abandon the whole transfer on Filemail's
+            #    server (which would leave partial bytes that look corrupted).
+            #    Each file gets FILE_ATTEMPTS full-file retries; chunk-level
+            #    retries happen inside _upload_file/_send_chunk_with_retry.
+            FILE_ATTEMPTS = 3
             for i, path in enumerate(self._files):
                 if self._stopped:
-                    return
-                self._upload_file(Path(path), turl, tid, tkey)
+                    break
+                p = Path(path)
+                last_err: Exception | None = None
+                for file_attempt in range(1, FILE_ATTEMPTS + 1):
+                    if self._stopped:
+                        break
+                    try:
+                        self._upload_file(p, turl, tid, tkey)
+                        uploaded += 1
+                        last_err = None
+                        break
+                    except Exception as file_err:
+                        last_err = file_err
+                        if file_attempt < FILE_ATTEMPTS:
+                            log.warning(
+                                f"File attempt {file_attempt}/{FILE_ATTEMPTS} failed "
+                                f"for {p.name}: {file_err} — retrying whole file"
+                            )
+                            time.sleep(2 * file_attempt)
+                if last_err is not None:
+                    log.error(
+                        f"Upload permanently failed for {p.name} "
+                        f"after {FILE_ATTEMPTS} attempts: {last_err}"
+                    )
+                    failed.append(p.name)
                 self.progress.emit(i + 1, len(self._files))
 
-            # 3. Complete transfer
+            # If the user cancelled, don't seal the transfer.
+            if self._stopped:
+                return
+
+            if uploaded == 0:
+                raise RuntimeError("Nessun file è stato caricato con successo.")
+
+            # 3. Complete transfer — always called so Filemail properly seals
+            #    it, even when some files errored above.
             cparams: dict = {"transferid": tid, "transferkey": tkey}
             if self._api_key:
                 cparams["apikey"] = self._api_key
@@ -676,10 +718,25 @@ class FilemailUploader(QThread):
                 )
             self.done.emit(dl_url)
 
+            if failed:
+                self.warning.emit(
+                    f"{len(failed)} foto non caricate (riprovare separatamente):\n"
+                    + "\n".join(f"• {n}" for n in failed)
+                )
+
         except Exception as exc:
             self.error.emit(str(exc))
 
     def _upload_file(self, path: Path, turl: str, tid: str, tkey: str):
+        # Quick sanity check before consuming any upload quota: verify the file
+        # is a readable image. A locally-corrupt file would burn all retry
+        # attempts against the server for no reason.
+        try:
+            with PilImage.open(str(path)) as _img:
+                _img.verify()
+        except Exception as e:
+            raise RuntimeError(f"Il file è danneggiato o non è un'immagine valida: {e}")
+
         size = path.stat().st_size
         with open(path, "rb") as fh:
             offset = 0
@@ -696,17 +753,14 @@ class FilemailUploader(QThread):
                     "totalsize":   size,
                     "thefilename": path.name,
                 })
-                req = urllib.request.Request(
-                    f"{turl}?{qs}",
-                    data=chunk,
-                    method="POST",
-                    headers={
-                        "Content-Type":   "application/octet-stream",
-                        "Content-Length": str(len(chunk)),
-                        "User-Agent":     "PhotoSelector/1.0",
-                    },
+                headers = {
+                    "Content-Type":   "application/octet-stream",
+                    "Content-Length": str(len(chunk)),
+                    "User-Agent":     "PhotoSelector/1.0",
+                }
+                self._send_chunk_with_retry(
+                    f"{turl}?{qs}", chunk, headers, path.name, offset
                 )
-                self._send_chunk_with_retry(req, path.name, offset)
                 offset += len(chunk)
 
         # Defensive check: a silently-truncated upload must not be reported as success
@@ -716,20 +770,30 @@ class FilemailUploader(QThread):
                 f"inviati {offset} byte su {size}"
             )
 
-    def _send_chunk_with_retry(self, req, filename: str, offset: int, attempts: int = 3):
-        """Uploads one chunk, validating the response and retrying transient failures.
+    def _send_chunk_with_retry(
+        self,
+        url: str,
+        chunk: bytes,
+        headers: dict,
+        filename: str,
+        offset: int,
+        attempts: int = 5,
+    ):
+        """Uploads one chunk, rebuilding the Request on every attempt.
 
-        Filemail's chunk endpoint can return HTTP 200 with an app-level error in
-        the JSON body; previously that body was discarded unread, so a failed
-        chunk silently passed and the file ended up corrupted on the recipient
-        side with no error shown to the user.
+        urllib.request.Request can accumulate internal state (added headers, handler
+        references) after a failed urlopen call, causing subsequent retries to send a
+        malformed request. Building a fresh Request each time avoids this.
         """
         last_err: Exception | None = None
         for attempt in range(1, attempts + 1):
             if self._stopped:
                 return
             try:
-                with urllib.request.urlopen(req, timeout=180) as resp:
+                req = urllib.request.Request(
+                    url, data=chunk, method="POST", headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
                     body = resp.read()
@@ -743,7 +807,7 @@ class FilemailUploader(QThread):
             except Exception as e:
                 last_err = e
                 if attempt < attempts:
-                    time.sleep(1.5 * attempt)
+                    time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s, 8s back-off
         raise RuntimeError(
             f"Caricamento del chunk fallito per {filename} (offset {offset}) "
             f"dopo {attempts} tentativi: {last_err}"
@@ -2227,6 +2291,7 @@ class PhotoSelector(QMainWindow):
         self._share_worker = FilemailUploader(files, email, api_key)
         self._share_worker.progress.connect(self._on_share_progress)
         self._share_worker.done.connect(self._on_share_done)
+        self._share_worker.warning.connect(self._on_share_warning)
         self._share_worker.error.connect(self._on_share_error)
         self._share_progress.canceled.connect(self._share_worker.stop)
         self._share_worker.start()
@@ -2244,6 +2309,9 @@ class PhotoSelector(QMainWindow):
             self._share_progress.close()
             self._share_progress = None
         ShareLinkDialog(self, url).exec_()
+
+    def _on_share_warning(self, msg: str):
+        QMessageBox.warning(self, "Alcune foto non caricate", msg)
 
     def _on_share_error(self, msg: str):
         if self._share_progress:
@@ -2327,5 +2395,5 @@ if __name__ == "__main__":
 
     window = PhotoSelector()
     window.setWindowIcon(icon)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec_())
