@@ -86,8 +86,9 @@ FILEMAIL_BASE  = "https://www.filemail.com"
 # Filemail recommends chunks of 5–50 MB (for files >50 MB). Photos here are
 # <10 MB, so a 25 MB chunk means every photo is sent in a single HTTP request —
 # no server-side chunk assembly, no partial-file corruption risk.
-FILEMAIL_CHUNK = 25 * 1024 * 1024
-SETTINGS_PATH  = Path.home() / ".photoselector_settings.json"
+FILEMAIL_CHUNK      = 25 * 1024 * 1024
+FILEMAIL_FREE_LIMIT = 5 * 1024 * 1024 * 1024   # 5 GB free-tier cap
+SETTINGS_PATH       = Path.home() / ".photoselector_settings.json"
 
 
 def _load_settings() -> dict:
@@ -101,6 +102,16 @@ def _save_settings(data: dict) -> None:
     current = _load_settings()
     current.update(data)
     SETTINGS_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+
+def _fmt_size(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f} GB"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.0f} MB"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f} KB"
+    return f"{n} B"
 
 # ── Crash logging + GitHub auto-reporting ─────────────────────────────────────
 
@@ -957,81 +968,360 @@ class FilmStrip(QListWidget):
         self._selected.update(new_indices)
         self.viewport().update()
 
-# ── Crop selection widget + dialog ────────────────────────────────────────────
+# ── Crop canvas (interactive handles + pan + zoom) ────────────────────────────
+
+_HANDLE_R = 6   # handle radius in widget pixels
+
+_ASPECT_PRESETS: list[tuple[str, float | None]] = [
+    ("Libero",    None),
+    ("Originale", -1.0),
+    ("1:1",       1.0),
+    ("9:16",      9 / 16),
+    ("16:9",      16 / 9),
+    ("4:5",       4 / 5),
+    ("5:4",       5 / 4),
+    ("3:4",       3 / 4),
+    ("4:3",       4 / 3),
+    ("2:3",       2 / 3),
+    ("3:2",       3 / 2),
+    ("5:7",       5 / 7),
+    ("7:5",       7 / 5),
+    ("1:2",       1 / 2),
+    ("2:1",       2 / 1),
+]
+
+_PRESET_BTN_STYLE = (
+    "QPushButton {"
+    " background:#2a2a2a; color:#bbb; border:1px solid #404040;"
+    " border-radius:4px; padding:2px 8px; font-size:11px;"
+    "}"
+    "QPushButton:hover  { background:#3a3a3a; color:#eee; }"
+    "QPushButton:checked {"
+    " background:#0078d4; color:#fff; border-color:#0078d4; font-weight:bold;"
+    "}"
+)
+
 
 class _CropCanvas(QWidget):
-    """Image widget that lets the user drag a crop rectangle."""
-    crop_changed = pyqtSignal(QRect)
+    """Crop widget where the frame lives in screen-space (widget coords).
 
-    def __init__(self, qimg: 'QImage', parent=None):
+    • Drag a handle  → resize the crop frame (frame stays in screen)
+    • Drag inside    → move the crop frame
+    • Drag outside   → pan the image behind the fixed frame
+    • Mouse wheel    → zoom image around cursor (frame stays put)
+    """
+
+    def __init__(self, pixmap: QPixmap, orig_w: int, orig_h: int, parent=None):
         super().__init__(parent)
-        self._img      = qimg
-        self._start:   QPoint | None = None
-        self._cur:     QPoint | None = None
-        self._dragging = False
-        self.setCursor(Qt.CrossCursor)
+        self._pixmap = pixmap
+        self._orig_w = orig_w
+        self._orig_h = orig_h
+        self._aspect: float | None = None
 
-    def clear_selection(self):
-        self._start = self._cur = None
-        self._dragging = False
-        self.update()
+        # View state: zoom + what image coord sits at the widget centre
+        self._view_scale = 1.0
+        self._center_img = QPointF(orig_w / 2.0, orig_h / 2.0)
+
+        # Crop frame in WIDGET pixels — stable on screen while image moves
+        self._crop_w: QRectF = QRectF()
+        self._crop_init      = False    # set on first layout/paint
+
+        # Drag state
+        self._drag_mode       = ""
+        self._drag_start_pos  = QPointF()
+        self._drag_start_crop = QRectF()
+        self._drag_start_ctr  = QPointF()
+
+        self.setMouseTracking(True)
+        self.setMinimumSize(480, 360)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet("background: #111;")
+
+    # ── initialisation ────────────────────────────────────────────────────────
+
+    def _init_crop(self):
+        """Align crop frame to the full image at fit-to-window zoom."""
+        ww, wh = float(self.width()), float(self.height())
+        if ww == 0 or wh == 0:
+            return
+        self._view_scale = 1.0
+        self._center_img = QPointF(self._orig_w / 2.0, self._orig_h / 2.0)
+        self._crop_w     = QRectF(self._draw_rect())
+        self._crop_init  = True
+        if self._aspect is not None and self._aspect > 0:
+            self._apply_aspect()
+
+    # ── aspect ratio ──────────────────────────────────────────────────────────
+
+    def set_aspect(self, aspect: float | None):
+        self._aspect = aspect
+        if self._crop_init:
+            if aspect is not None and aspect > 0:
+                self._apply_aspect()
+            self.update()
+
+    def _apply_aspect(self):
+        """Resize crop frame to fill the image area at the current aspect ratio."""
+        asp = self._aspect
+        if not asp or asp <= 0:
+            return
+        dr = self._draw_rect()
+        dw, dh = dr.width(), dr.height()
+        if dw <= 0 or dh <= 0:
+            return
+        if dw / dh > asp:
+            ch = dh;  cw = ch * asp
+        else:
+            cw = dw;  ch = cw / asp
+        cx, cy = dr.center().x(), dr.center().y()
+        self._crop_w = QRectF(cx - cw / 2, cy - ch / 2, cw, ch)
+
+    # ── coordinate helpers ────────────────────────────────────────────────────
+
+    def _display_scale(self) -> float:
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        ww, wh = self.width(), self.height()
+        if not (pw and ph and ww and wh):
+            return 1.0
+        return min(ww / pw, wh / ph) * self._view_scale
+
+    def _draw_rect(self) -> QRectF:
+        ds = self._display_scale()
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        ox = self.width()  / 2 - self._center_img.x() * ds
+        oy = self.height() / 2 - self._center_img.y() * ds
+        return QRectF(ox, oy, pw * ds, ph * ds)
+
+    def _widget_to_img(self, pt: QPointF) -> QPointF:
+        dr = self._draw_rect()
+        if not (dr.width() and dr.height()):
+            return QPointF()
+        return QPointF(
+            (pt.x() - dr.x()) * self._orig_w / dr.width(),
+            (pt.y() - dr.y()) * self._orig_h / dr.height(),
+        )
+
+    # ── handle helpers ────────────────────────────────────────────────────────
+
+    def _handle_points(self) -> dict[str, QPointF]:
+        r  = self._crop_w
+        cx, cy = r.center().x(), r.center().y()
+        return {
+            "tl": r.topLeft(),     "t":  QPointF(cx, r.top()),
+            "tr": r.topRight(),    "r":  QPointF(r.right(), cy),
+            "br": r.bottomRight(), "b":  QPointF(cx, r.bottom()),
+            "bl": r.bottomLeft(),  "l":  QPointF(r.left(), cy),
+        }
+
+    def _hit_handle(self, pos: QPointF) -> str:
+        thresh = _HANDLE_R * 2.5
+        for name, pt in self._handle_points().items():
+            d = pos - pt
+            if (d.x() ** 2 + d.y() ** 2) ** 0.5 <= thresh:
+                return name
+        return ""
+
+    @staticmethod
+    def _cursor_for(mode: str) -> Qt.CursorShape:
+        return {
+            "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+            "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+            "t":  Qt.SizeVerCursor,   "b":  Qt.SizeVerCursor,
+            "l":  Qt.SizeHorCursor,   "r":  Qt.SizeHorCursor,
+            "move": Qt.SizeAllCursor, "pan": Qt.OpenHandCursor,
+        }.get(mode, Qt.ArrowCursor)
+
+    # ── paint ─────────────────────────────────────────────────────────────────
+
+    def paintEvent(self, _):
+        if not self._crop_init:
+            self._init_crop()
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        p.drawPixmap(self._draw_rect().toRect(), self._pixmap)
+
+        cr  = self._crop_w
+        dim = QColor(0, 0, 0, 155)
+        w, h = float(self.width()), float(self.height())
+        p.fillRect(QRectF(0,          0,          w,               cr.top()),        dim)
+        p.fillRect(QRectF(0,          cr.bottom(), w,               h - cr.bottom()), dim)
+        p.fillRect(QRectF(0,          cr.top(),    cr.left(),        cr.height()),     dim)
+        p.fillRect(QRectF(cr.right(), cr.top(),    w - cr.right(),   cr.height()),     dim)
+
+        # Crop border
+        p.setPen(QPen(Qt.white, 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(cr)
+
+        # Rule-of-thirds grid (always shown, clearly visible)
+        p.setPen(QPen(QColor(255, 255, 255, 170), 1.5))
+        for frac in (1 / 3, 2 / 3):
+            p.drawLine(QPointF(cr.left() + cr.width() * frac, cr.top()),
+                       QPointF(cr.left() + cr.width() * frac, cr.bottom()))
+            p.drawLine(QPointF(cr.left(),  cr.top() + cr.height() * frac),
+                       QPointF(cr.right(), cr.top() + cr.height() * frac))
+
+        # Handles
+        p.setPen(QPen(Qt.white, 1.5))
+        p.setBrush(QColor(255, 255, 255, 220))
+        for pt in self._handle_points().values():
+            p.drawEllipse(pt, float(_HANDLE_R), float(_HANDLE_R))
+
+        p.end()
+
+    # ── mouse ─────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._start    = e.pos()
-            self._cur      = e.pos()
-            self._dragging = True
-            self.update()
+        if e.button() != Qt.LeftButton:
+            return
+        pos    = QPointF(e.pos())
+        handle = self._hit_handle(pos)
+        if handle:
+            self._drag_mode = handle
+        elif self._crop_w.contains(pos):
+            self._drag_mode = "move"
+        else:
+            self._drag_mode = "pan"
+        self._drag_start_pos  = pos
+        self._drag_start_crop = QRectF(self._crop_w)
+        self._drag_start_ctr  = QPointF(self._center_img)
+        self.setCursor(self._cursor_for(self._drag_mode))
 
     def mouseMoveEvent(self, e):
-        if self._dragging:
-            self._cur = e.pos()
+        pos = QPointF(e.pos())
+
+        if not (e.buttons() & Qt.LeftButton):
+            handle = self._hit_handle(pos)
+            if handle:
+                self.setCursor(self._cursor_for(handle))
+            elif self._crop_w.contains(pos):
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.OpenHandCursor)
+            return
+
+        delta = pos - self._drag_start_pos
+        mode  = self._drag_mode
+
+        if mode == "pan":
+            ds = self._display_scale()
+            if ds:
+                self._center_img = QPointF(
+                    self._drag_start_ctr.x() - delta.x() / ds,
+                    self._drag_start_ctr.y() - delta.y() / ds,
+                )
             self.update()
+            return
+
+        # Resize or move crop frame — all in widget pixels; no image scaling
+        c = QRectF(self._drag_start_crop)
+        if mode == "move":
+            c.translate(delta)
+        else:
+            if "l" in mode: c.setLeft(c.left()     + delta.x())
+            if "r" in mode: c.setRight(c.right()   + delta.x())
+            if "t" in mode: c.setTop(c.top()       + delta.y())
+            if "b" in mode: c.setBottom(c.bottom() + delta.y())
+            c = c.normalized()
+
+            asp = self._aspect
+            if asp is not None and asp > 0:
+                if mode in ("t", "b"):
+                    nw = c.height() * asp;  mx = c.center().x()
+                    c.setLeft(mx - nw / 2); c.setRight(mx + nw / 2)
+                elif mode in ("l", "r"):
+                    nh = c.width() / asp;   my = c.center().y()
+                    c.setTop(my - nh / 2);  c.setBottom(my + nh / 2)
+                elif mode in ("tl", "bl"):
+                    c.setLeft(c.right()  - c.height() * asp)
+                elif mode in ("tr", "br"):
+                    c.setRight(c.left()  + c.height() * asp)
+
+        if c.width()  < 20: c.setWidth(20)
+        if c.height() < 20: c.setHeight(20)
+
+        self._crop_w = c
+        self._clamp_crop_w()
+        self.update()
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton and self._dragging:
-            self._cur      = e.pos()
-            self._dragging = False
-            r = self._sel()
-            if r is not None and r.width() > 8 and r.height() > 8:
-                self.crop_changed.emit(r)
-            self.update()
+        if e.button() == Qt.LeftButton:
+            self._drag_mode = ""
+            pos    = QPointF(e.pos())
+            handle = self._hit_handle(pos)
+            if handle:
+                self.setCursor(self._cursor_for(handle))
+            elif self._crop_w.contains(pos):
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.OpenHandCursor)
 
-    def _sel(self) -> 'QRect | None':
-        if self._start is None or self._cur is None:
-            return None
-        return QRect(self._start, self._cur).normalized()
+    def wheelEvent(self, e):
+        # Zoom image around cursor; crop frame stays fixed in widget coords
+        factor    = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
+        new_scale = max(0.5, min(10.0, self._view_scale * factor))
+        mouse_img        = self._widget_to_img(QPointF(e.pos()))
+        self._view_scale = new_scale
+        ds               = self._display_scale()
+        mx, my           = float(e.pos().x()), float(e.pos().y())
+        self._center_img = QPointF(
+            mouse_img.x() - (mx - self.width()  / 2) / ds,
+            mouse_img.y() - (my - self.height() / 2) / ds,
+        )
+        self.update()
 
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.drawImage(0, 0, self._img)
-        r = self._sel()
-        if r:
-            w, h = self.width(), self.height()
-            dim = QColor(0, 0, 0, 130)
-            p.fillRect(0,        0,        w,        r.top(),              dim)
-            p.fillRect(0,        r.bottom(), w,       h - r.bottom(),      dim)
-            p.fillRect(0,        r.top(),   r.left(), r.height(),           dim)
-            p.fillRect(r.right(), r.top(),  w - r.right(), r.height(),      dim)
-            p.setPen(QPen(QColor(255, 70, 70), 2))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(r)
-            # corner handles
-            p.setBrush(QColor(255, 70, 70))
-            for pt in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):
-                p.drawEllipse(pt, 4, 4)
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if not self._crop_init:
+            self._init_crop()
+        else:
+            self._clamp_crop_w()
+        self.update()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _clamp_crop_w(self):
+        c  = self._crop_w
+        ww = float(self.width())
+        wh = float(self.height())
+        if c.right()  > ww: c.translate(ww - c.right(),  0)
+        if c.left()   < 0:  c.translate(-c.left(),        0)
+        if c.bottom() > wh: c.translate(0, wh - c.bottom())
+        if c.top()    < 0:  c.translate(0, -c.top())
+        c.setLeft(max(0.0, c.left()));  c.setRight(min(ww, c.right()))
+        c.setTop(max(0.0, c.top()));    c.setBottom(min(wh, c.bottom()))
+        self._crop_w = c
+
+    def get_crop_rect(self) -> QRect:
+        """Crop result in original image pixel coordinates."""
+        tl = self._widget_to_img(self._crop_w.topLeft())
+        br = self._widget_to_img(self._crop_w.bottomRight())
+        x  = max(0, int(tl.x()))
+        y  = max(0, int(tl.y()))
+        x2 = min(self._orig_w, int(br.x()))
+        y2 = min(self._orig_h, int(br.y()))
+        return QRect(x, y, max(1, x2 - x), max(1, y2 - y))
+
+    def reset_crop(self):
+        """Reset frame to full image at fit-to-window zoom."""
+        self._crop_init = False
+        self._init_crop()
+        self.update()
 
 
 class CropDialog(QDialog):
-    """Shows a photo and lets the user drag a crop selection."""
+    """Crop dialog with aspect ratio presets, drag handles, pan, and zoom."""
 
     def __init__(self, image_path: str, parent=None, img_bgr: '_np.ndarray | None' = None,
                  title: str = "Ritaglia foto",
-                 hint_text: str = "Trascina per selezionare l'area da ritagliare.\n"
-                                  "Lascia senza selezione per usare la foto intera."):
+                 hint_text: str = ""):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
+        self.setStyleSheet(BASE_STYLE)
 
         if img_bgr is not None:
             img = img_bgr
@@ -1040,53 +1330,104 @@ class CropDialog(QDialog):
             if img is None:
                 img = _np.zeros((100, 100, 3), dtype=_np.uint8)
         oh, ow = img.shape[:2]
-        screen = QApplication.primaryScreen()
-        avail  = screen.availableGeometry() if screen else None
-        max_w  = int(avail.width()  * 0.85) if avail else 1000
-        max_h  = int(avail.height() * 0.80) if avail else 750
-        self._scale = min(max_w / ow, max_h / oh, 1.0)
-        dw, dh = int(ow * self._scale), int(oh * self._scale)
+        self._orig_w, self._orig_h = ow, oh
 
-        rgb   = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
-        qimg  = QImage(rgb.data, ow, oh, 3 * ow, QImage.Format_RGB888).scaled(
-            dw, dh, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self._crop: QRect | None = None
+        rgb    = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB)
+        qimg   = QImage(rgb.data, ow, oh, 3 * ow, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg.copy())
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
-        hint = QLabel(hint_text)
-        hint.setStyleSheet("color:#aaa; font-size:12px;")
+        # ── Instruction bar ───────────────────────────────────────────────────
+        hint = QLabel(
+            "Bordi/angoli: ridimensiona  ·  Dentro: sposta il riquadro  ·  "
+            "Fuori: sposta l'immagine  ·  Rotellina: zoom"
+        )
+        hint.setStyleSheet("color: #777; font-size: 11px;")
         lay.addWidget(hint)
 
-        self._canvas = _CropCanvas(qimg, self)
-        self._canvas.setFixedSize(dw, dh)
-        self._canvas.crop_changed.connect(self._on_crop)
-        lay.addWidget(self._canvas, alignment=Qt.AlignCenter)
+        # ── Aspect ratio chips (scrollable row) ───────────────────────────────
+        scroll = QScrollArea()
+        scroll.setFixedHeight(44)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:horizontal { height: 4px; background: #222; }"
+            "QScrollBar::handle:horizontal { background: #555; border-radius: 2px; }"
+        )
+        chip_widget = QWidget()
+        chip_widget.setStyleSheet("background: transparent;")
+        chip_lay = QHBoxLayout(chip_widget)
+        chip_lay.setContentsMargins(0, 4, 0, 4)
+        chip_lay.setSpacing(5)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._aspect_btns: list[QPushButton] = []
+        for label, ratio in _ASPECT_PRESETS:
+            btn = QPushButton(label)
+            btn.setFixedHeight(28)
+            btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setStyleSheet(_PRESET_BTN_STYLE)
+            btn.clicked.connect(lambda _c, r=ratio, b=btn: self._set_aspect(r, b))
+            self._aspect_btns.append(btn)
+            chip_lay.addWidget(btn)
+        chip_lay.addStretch()
+        scroll.setWidget(chip_widget)
+        lay.addWidget(scroll)
+
+        # ── Canvas ────────────────────────────────────────────────────────────
+        self._canvas = _CropCanvas(pixmap, ow, oh, self)
+        lay.addWidget(self._canvas, 1)
+
+        # ── Dialog buttons ────────────────────────────────────────────────────
+        btns      = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        btn_clear = btns.addButton("Usa foto intera", QDialogButtonBox.ResetRole)
-        btn_clear.clicked.connect(self._clear)
-        btn_clear.setFocusPolicy(Qt.NoFocus)
+        btn_reset = btns.addButton("Usa foto intera", QDialogButtonBox.ResetRole)
+        btn_reset.clicked.connect(self._canvas.reset_crop)
+        btn_reset.setFocusPolicy(Qt.NoFocus)
         lay.addWidget(btns)
 
-        self.adjustSize()
+        screen = QApplication.primaryScreen()
+        avail  = screen.availableGeometry() if screen else None
+        max_w  = int(avail.width()  * 0.88) if avail else 1100
+        max_h  = int(avail.height() * 0.88) if avail else 850
+        self.resize(max_w, max_h)
 
-    def _on_crop(self, rect: QRect):
-        s = 1.0 / self._scale
-        self._crop = QRect(int(rect.x() * s), int(rect.y() * s),
-                           int(rect.width() * s), int(rect.height() * s))
+        # ── Restore last used aspect ratio ────────────────────────────────────
+        last_label = _load_settings().get("last_crop_aspect_label", "Libero")
+        for i, (lbl, ratio) in enumerate(_ASPECT_PRESETS):
+            is_match = lbl == last_label
+            self._aspect_btns[i].setChecked(is_match)
+            if is_match and ratio != None:  # None = Libero, no reshape needed
+                actual: float | None = (
+                    float(ow) / max(oh, 1) if ratio == -1.0 else ratio
+                )
+                self._canvas.set_aspect(actual)
 
-    def _clear(self):
-        self._crop = None
-        self._canvas.clear_selection()
+    # ── Aspect ratio ──────────────────────────────────────────────────────────
+
+    def _set_aspect(self, ratio: float | None, sender: QPushButton):
+        for btn in self._aspect_btns:
+            btn.setChecked(btn is sender)
+        actual: float | None = (
+            float(self._orig_w) / max(self._orig_h, 1) if ratio == -1.0 else ratio
+        )
+        self._canvas.set_aspect(actual)
+        label = next((lbl for lbl, r in _ASPECT_PRESETS if r == ratio), "Libero")
+        _save_settings({"last_crop_aspect_label": label})
+
+    # ── Result ────────────────────────────────────────────────────────────────
 
     def crop_rect(self) -> 'QRect | None':
-        return self._crop
+        r = self._canvas.get_crop_rect()
+        if r.x() == 0 and r.y() == 0 and r.width() == self._orig_w and r.height() == self._orig_h:
+            return None
+        return r
 
 
 # ── Image view ────────────────────────────────────────────────────────────────
@@ -1560,6 +1901,11 @@ class PhotoSelector(QMainWindow):
         self._rotate_thumb_idx: int | None             = None  # needs thumb regen
         self._share_worker:   FilemailUploader | None  = None
         self._share_progress: QProgressDialog | None   = None
+        self._share_links:    list[str]                = []   # accumulated download URLs
+        self._share_batch2:   list                     = []   # second-batch for split transfers
+        self._share_email:    str                      = ""
+        self._share_apikey:   str                      = ""
+        self._share_n_batches: int                     = 1
         self._dest_folder:    str                       = DEST_FOLDER
         self._discard_history: list[tuple[Path, Path, int]] = []
         self._space_press_idx: int = -1
@@ -2347,6 +2693,70 @@ class PhotoSelector(QMainWindow):
             )
             return
 
+        # ── 5 GB free-tier check ──────────────────────────────────────────────
+        self._share_links   = []
+        self._share_batch2  = []
+        self._share_n_batches = 1
+
+        total_bytes = sum(f.stat().st_size for f in files)
+        if total_bytes > FILEMAIL_FREE_LIMIT:
+            total_gb = total_bytes / (1024 ** 3)
+            box = QMessageBox(self)
+            box.setWindowTitle("Dimensione oltre il limite Filemail")
+            box.setText(
+                f"La cartella '{self._dest_folder}' pesa {total_gb:.1f} GB, "
+                f"ma il piano gratuito di Filemail consente al massimo 5 GB per trasferimento.\n\n"
+                "Cosa vuoi fare?"
+            )
+            btn_trim   = box.addButton("Invia solo i primi 5 GB",   QMessageBox.AcceptRole)
+            btn_split  = box.addButton("Due trasferimenti (2 link)", QMessageBox.AcceptRole)
+            btn_cancel = box.addButton("Annulla",                    QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec_()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel or clicked is None:
+                return
+
+            # Build batch1 (up to 5 GB in order) and batch2 (remainder)
+            batch1: list = [];  running = 0;  limit_hit = False
+            batch2: list = []
+            for f in files:
+                sz = f.stat().st_size
+                if not limit_hit and running + sz <= FILEMAIL_FREE_LIMIT:
+                    batch1.append(f);  running += sz
+                else:
+                    limit_hit = True
+                    if clicked is btn_split:
+                        batch2.append(f)
+
+            if not batch1:
+                QMessageBox.warning(self, "Nessuna foto",
+                                    "La prima foto supera già il limite di 5 GB.")
+                return
+
+            if clicked is btn_split and batch2:
+                # Trim batch2 to 5 GB as well
+                batch2_size = sum(f.stat().st_size for f in batch2)
+                if batch2_size > FILEMAIL_FREE_LIMIT:
+                    trimmed2: list = [];  r2 = 0
+                    for f in batch2:
+                        sz = f.stat().st_size
+                        if r2 + sz <= FILEMAIL_FREE_LIMIT:
+                            trimmed2.append(f);  r2 += sz
+                        else:
+                            break
+                    batch2 = trimmed2
+                    if batch2:
+                        QMessageBox.information(
+                            self, "Secondo trasferimento ridotto",
+                            "Anche il secondo trasferimento supera 5 GB — "
+                            "verranno inviati solo i file che rientrano nel limite."
+                        )
+                self._share_batch2  = batch2
+                self._share_n_batches = 2
+
+            files = batch1
+
         settings = _load_settings()
         email    = settings.get("filemail_email", "")
         api_key  = settings.get("filemail_apikey", "")
@@ -2359,16 +2769,26 @@ class PhotoSelector(QMainWindow):
             api_key = dlg.api_key()
             _save_settings({"filemail_email": email, "filemail_apikey": api_key})
 
+        self._share_email  = email
+        self._share_apikey = api_key
+        self._start_share_batch(files)
+
+    def _start_share_batch(self, files: list):
+        batch_num = len(self._share_links) + 1
         n = len(files)
-        self._share_progress = QProgressDialog(
-            f"Caricamento foto 0 di {n}...", "Annulla", 0, n, self
+        label = (
+            f"Trasferimento {batch_num} di {self._share_n_batches} — "
+            f"caricamento foto 0 di {n}..."
+            if self._share_n_batches > 1
+            else f"Caricamento foto 0 di {n}..."
         )
+        self._share_progress = QProgressDialog(label, "Annulla", 0, n, self)
         self._share_progress.setWindowTitle("Caricamento su Filemail")
         self._share_progress.setWindowModality(Qt.WindowModal)
         self._share_progress.setMinimumWidth(400)
         self._share_progress.setValue(0)
 
-        self._share_worker = FilemailUploader(files, email, api_key)
+        self._share_worker = FilemailUploader(files, self._share_email, self._share_apikey)
         self._share_worker.progress.connect(self._on_share_progress)
         self._share_worker.done.connect(self._on_share_done)
         self._share_worker.warning.connect(self._on_share_warning)
@@ -2380,15 +2800,91 @@ class PhotoSelector(QMainWindow):
     def _on_share_progress(self, done: int, total: int):
         if self._share_progress:
             self._share_progress.setValue(done)
+            batch_num = len(self._share_links) + 1
+            prefix = (
+                f"Trasferimento {batch_num} di {self._share_n_batches} — "
+                if self._share_n_batches > 1 else ""
+            )
             self._share_progress.setLabelText(
-                f"Caricamento foto {done} di {total}..."
+                f"{prefix}Caricamento foto {done} di {total}..."
             )
 
     def _on_share_done(self, url: str):
         if self._share_progress:
             self._share_progress.close()
             self._share_progress = None
-        ShareLinkDialog(self, url).exec_()
+        self._share_links.append(url)
+
+        if self._share_batch2:
+            # Launch the second transfer
+            batch2 = self._share_batch2
+            self._share_batch2 = []
+            self._start_share_batch(batch2)
+            return
+
+        # All batches complete — show results
+        if len(self._share_links) == 1:
+            ShareLinkDialog(self, self._share_links[0]).exec_()
+        else:
+            self._show_multi_link_dialog(self._share_links)
+        self._share_links = []
+
+    def _show_multi_link_dialog(self, urls: list[str]):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Foto condivise!")
+        dlg.setMinimumWidth(540)
+        dlg.setStyleSheet(BASE_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(12)
+        lay.setContentsMargins(24, 24, 24, 24)
+
+        title = QLabel(f"✅  Foto caricate in {len(urls)} trasferimenti!")
+        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #00c870;")
+        lay.addWidget(title)
+
+        sub = QLabel(
+            "Le foto sono state divise in due link (disponibili 7 giorni ciascuno).\n"
+            "Condividi entrambi i link con il destinatario."
+        )
+        sub.setWordWrap(True)
+        sub.setStyleSheet("color: #aaa;")
+        lay.addWidget(sub)
+
+        copy_btns: list[QPushButton] = []
+        for i, url in enumerate(urls):
+            lbl = QLabel(f"Link {i + 1}:")
+            lbl.setStyleSheet("color: #ccc; font-weight: bold;")
+            lay.addWidget(lbl)
+
+            row = QHBoxLayout()
+            edit = QLineEdit(url)
+            edit.setReadOnly(True)
+            edit.setStyleSheet(
+                "background:#1a1a1a; color:#f0f0f0; padding:6px;"
+                "border:1px solid #444; border-radius:4px;"
+            )
+            row.addWidget(edit, 1)
+
+            btn_copy = QPushButton("📋  Copia")
+            btn_copy.setFixedHeight(34)
+            copy_btns.append(btn_copy)
+
+            def _copy(u=url, b=btn_copy):
+                QApplication.clipboard().setText(u)
+                b.setText("✅  Copiato!")
+            btn_copy.clicked.connect(_copy)
+            row.addWidget(btn_copy)
+            lay.addLayout(row)
+
+            btn_browser = QPushButton(f"🌐  Apri link {i + 1} nel browser")
+            btn_browser.clicked.connect(lambda _, u=url: QDesktopServices.openUrl(QUrl(u)))
+            lay.addWidget(btn_browser)
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setStyleSheet(ACCENT_STYLE)
+        btn_close.clicked.connect(dlg.accept)
+        lay.addWidget(btn_close)
+        dlg.exec_()
 
     def _on_share_warning(self, msg: str):
         QMessageBox.warning(self, "Alcune foto non caricate", msg)
@@ -2453,6 +2949,17 @@ class PhotoSelector(QMainWindow):
             if n_sel else
             f"📋  Copia selezionate{' ' + folder_label if folder_label else ''}"
         )
+        if n_sel > 0 and self.photos:
+            total = sum(
+                self.photos[i].stat().st_size
+                for i in self.selected if 0 <= i < len(self.photos)
+            )
+            self.btn_copy.setToolTip(
+                f"Dimensione totale: {_fmt_size(total)}\n"
+                "Tasto destro → cartella di destinazione"
+            )
+        else:
+            self.btn_copy.setToolTip("Tasto destro → cartella di destinazione")
 
         if cur:
             sel_info = f"{n_sel} selezionate" if n_sel else "Nessuna selezionata"
