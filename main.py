@@ -1429,6 +1429,12 @@ class CropDialog(QDialog):
             return None
         return r
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space:
+            self.accept()
+        else:
+            super().keyPressEvent(event)
+
 
 # ── Image view ────────────────────────────────────────────────────────────────
 
@@ -1937,31 +1943,6 @@ class PhotoSelector(QMainWindow):
             self.btn_info.setChecked(True)
             self._toggle_info()
 
-        folder_str = settings.get("last_folder")
-        last_index = settings.get("last_index", 0)
-        if not folder_str:
-            return
-        folder = Path(folder_str)
-        if not folder.is_dir():
-            return
-        self._folder = folder
-        self.photos = sorted(
-            p for p in folder.iterdir()
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-        )
-        if not self.photos:
-            return
-        self.filmstrip.populate(len(self.photos))
-        self.progress_bar.setMaximum(len(self.photos))
-        self.progress_bar.setValue(0)
-        self.progress_bar.show()
-        self._thumb_loader = ThumbnailLoader(self.photos)
-        self._thumb_loader.ready.connect(self.filmstrip.set_thumbnail)
-        self._thumb_loader.progress.connect(self._on_thumb_progress)
-        self._thumb_loader.start()
-        _set_action("opening_folder", folder.name, len(self.photos))
-        self._go_to(min(last_index, len(self.photos) - 1))
-        self._sync_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
