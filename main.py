@@ -1730,6 +1730,8 @@ class LogoPositionDialog(QDialog):
 # ── Image view ────────────────────────────────────────────────────────────────
 
 class ImageView(QGraphicsView):
+    wm_clicked = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene(self)
@@ -1958,7 +1960,29 @@ class ImageView(QGraphicsView):
         if self._item:
             self._scale(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
 
+    def _wm_viewport_rect(self):
+        """Returns the watermark bounding rect in viewport coords, or None."""
+        if self._wm_preview is None or self._item is None:
+            return None
+        vp_rect = self.mapFromScene(self._item.sceneBoundingRect()).boundingRect()
+        iw = vp_rect.width()
+        ih = vp_rect.height()
+        px   = self._item.pixmap()
+        frac = self._wm_size_frac_h if px.width() >= px.height() else self._wm_size_frac_v
+        wm_w = max(1, int(iw * frac))
+        wm_h = max(1, int(self._wm_preview.height() * wm_w
+                           / max(1, self._wm_preview.width())))
+        margin = max(1, int(ih * 0.03))
+        wx = int(vp_rect.x() + (iw - wm_w) / 2)
+        wy = int(vp_rect.y() + ih - wm_h - margin)
+        return QRect(wx, wy, wm_w, wm_h)
+
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._wm_preview is not None:
+            rect = self._wm_viewport_rect()
+            if rect and rect.contains(event.pos()):
+                self.wm_clicked.emit()
+                return
         if event.button() == Qt.MiddleButton:
             self._fit()
         else:
@@ -2272,9 +2296,11 @@ class PhotoSelector(QMainWindow):
         self._discard_history: list[tuple[Path, Path, int]] = []
         self._space_press_idx: int = -1
         self._current_location: str = ""
-        self.watermarked:   set[int]    = set()
-        # None=auto-select per photo, "dark"=force dark, "light"=force light
+        self._watermark_enabled: bool   = False
+        # global color preference: None=auto, "dark", "light"
         self._wm_override: str | None = None
+        # per-photo click-override: {idx: "dark" | "light"}; absent = use auto
+        self._wm_photo_override: dict[int, str] = {}
         self.logo_marked:   set[int]    = set()
         self._logo_path:    str | None  = None
         self._logo_bgra                 = None   # numpy array, loaded once per session
@@ -2309,13 +2335,18 @@ class PhotoSelector(QMainWindow):
             self.btn_info.setChecked(True)
             self._toggle_info()
 
-        # Restore watermark sizes and color override.
+        # Restore watermark sizes, toggle state and color override.
         self.image_view.set_watermark_sizes(
             settings.get("watermark_size_pct_h", 22) / 100.0,
             settings.get("watermark_size_pct_v", 22) / 100.0,
         )
         saved_ov = settings.get("wm_override", "off")
         self._wm_override = None if saved_ov == "off" else saved_ov
+        if settings.get("watermark_enabled", False):
+            wms = _load_watermarks()
+            if wms["dark"] or wms["light"]:
+                self._watermark_enabled = True
+                self._apply_watermark_btn_style()
 
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -2521,6 +2552,7 @@ class PhotoSelector(QMainWindow):
         self.btn_rot_right.clicked.connect(lambda: self._rotate(clockwise=True))
         self.btn_crop.clicked.connect(self._crop_current)
         self.btn_watermark.clicked.connect(self._toggle_watermark)
+        self.image_view.wm_clicked.connect(self._cycle_wm_photo_color)
         self.btn_logo.clicked.connect(self._toggle_logo)
         self.btn_zin.clicked.connect(self.image_view.zoom_in)
         self.btn_zout.clicked.connect(self.image_view.zoom_out)
@@ -2994,28 +3026,26 @@ class PhotoSelector(QMainWindow):
     # ── Watermark ─────────────────────────────────────────────────────────────
 
     def _toggle_watermark(self):
-        if self.current_index < 0:
-            return
         wms = _load_watermarks()
         if not wms["dark"] and not wms["light"]:
             self._watermark_setup()
             wms = _load_watermarks()
             if not wms["dark"] and not wms["light"]:
                 return
-        if self.current_index in self.watermarked:
-            self.watermarked.discard(self.current_index)
-        else:
-            self.watermarked.add(self.current_index)
+        self._watermark_enabled = not self._watermark_enabled
         self._apply_watermark_btn_style()
+        _save_settings({
+            "watermark_enabled": self._watermark_enabled,
+            "wm_override": self._wm_override or "off",
+        })
         self._update_watermark_preview()
 
     def _apply_watermark_btn_style(self):
-        is_marked = self.current_index in self.watermarked
         suffix = {"dark": "  (scura)", "light": "  (chiara)"}.get(self._wm_override or "", "")
-        self.btn_watermark.setText(
-            f"✍  Firmata{suffix}" if is_marked else f"✍  Firma{suffix}"
+        self.btn_watermark.setText(f"✍  Firma{suffix}")
+        self.btn_watermark.setStyleSheet(
+            WATERMARK_ACTIVE_STYLE if self._watermark_enabled else ""
         )
-        self.btn_watermark.setStyleSheet(WATERMARK_ACTIVE_STYLE if is_marked else "")
 
     def _watermark_setup(self):
         wms = _load_watermarks()
@@ -3097,8 +3127,33 @@ class PhotoSelector(QMainWindow):
         )
         self._update_watermark_preview()
 
+    def _cycle_wm_photo_color(self):
+        """Cycles per-photo color override: (auto) → dark → light → (auto)."""
+        if self.current_index < 0:
+            return
+        wms = _load_watermarks()
+        if not (wms["dark"] and wms["light"]):
+            return  # only one variant, nothing to cycle
+        cur = self._wm_photo_override.get(self.current_index)
+        if cur is None:
+            # Determine auto choice, then set to the opposite
+            img = _cv2.imread(str(self.photos[self.current_index]))
+            if img is None:
+                return
+            auto = _pick_wm_path(img, wms)
+            self._wm_photo_override[self.current_index] = (
+                "light" if auto == wms["dark"] else "dark"
+            )
+        elif cur == "dark":
+            self._wm_photo_override[self.current_index] = "light"
+        else:
+            del self._wm_photo_override[self.current_index]  # back to auto
+        self._update_watermark_preview()
+
     def _update_watermark_preview(self):
-        if self.current_index < 0 or self.current_index not in self.watermarked:
+        if (not self._watermark_enabled
+                or self.current_index < 0
+                or self.current_index not in self.selected):
             self.image_view.set_watermark_preview(None)
             return
         wms = _load_watermarks()
@@ -3110,7 +3165,13 @@ class PhotoSelector(QMainWindow):
         if img is None:
             self.image_view.set_watermark_preview(None)
             return
-        if self._wm_override == "dark":
+        # Priority: per-photo override → global override → auto-detect
+        per_photo = self._wm_photo_override.get(self.current_index)
+        if per_photo == "dark":
+            wm_path = wms["dark"] or wms["light"]
+        elif per_photo == "light":
+            wm_path = wms["light"] or wms["dark"]
+        elif self._wm_override == "dark":
             wm_path = wms["dark"] or wms["light"]
         elif self._wm_override == "light":
             wm_path = wms["light"] or wms["dark"]
@@ -3162,7 +3223,8 @@ class PhotoSelector(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         self._logo_path    = path
-        self._logo_bgra    = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+        raw = _np.fromfile(path, dtype=_np.uint8)
+        self._logo_bgra    = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
         self._logo_pos_h   = dlg.result_pos_h()
         self._logo_pos_v   = dlg.result_pos_v()
         self._logo_size_h  = dlg.result_size_h()
@@ -3250,12 +3312,17 @@ class PhotoSelector(QMainWindow):
                     counter += 1
             try:
                 shutil.copy2(src, target)
-                if idx in self.watermarked:
+                if self._watermark_enabled:
                     try:
                         wms  = _load_watermarks()
                         img  = _cv2.imread(str(target))
                         if img is not None:
-                            if self._wm_override == "dark":
+                            per_photo = self._wm_photo_override.get(idx)
+                            if per_photo == "dark":
+                                wm_path = wms["dark"] or wms["light"]
+                            elif per_photo == "light":
+                                wm_path = wms["light"] or wms["dark"]
+                            elif self._wm_override == "dark":
                                 wm_path = wms["dark"] or wms["light"]
                             elif self._wm_override == "light":
                                 wm_path = wms["light"] or wms["dark"]
@@ -3579,6 +3646,7 @@ class PhotoSelector(QMainWindow):
             self.btn_select.setStyleSheet(SELECT_ACTIVE_STYLE if is_sel else "")
             self._apply_watermark_btn_style()
             self._apply_logo_btn_style()
+            self._update_watermark_preview()
             if is_sel:
                 self.image_view.start_snake()
             else:
