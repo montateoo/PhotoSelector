@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QProgressBar, QSlider,
     QListWidget, QListWidgetItem, QAbstractItemView,
     QStyledItemDelegate, QListView, QStyle,
-    QDialog, QLineEdit, QDialogButtonBox, QInputDialog, QMenu,
+    QDialog, QLineEdit, QDialogButtonBox, QInputDialog, QMenu, QSpinBox,
 )
 
 import cv2 as _cv2
@@ -158,6 +158,41 @@ def _composite_watermark(img_bgr: '_np.ndarray', wm_bgra: '_np.ndarray',
     out = img_bgr.astype(_np.float32)
     roi = out[y:ye, x:xe]
     wc  = wm[:ah, :aw]
+    if wc.shape[2] == 4:
+        a = wc[:, :, 3:4].astype(_np.float32) / 255.0
+        c = wc[:, :, :3].astype(_np.float32)
+    else:
+        a = _np.ones((ah, aw, 1), dtype=_np.float32)
+        c = wc.astype(_np.float32)
+    roi[:] = c * a + roi * (1.0 - a)
+    return out.astype(_np.uint8)
+
+
+def _logo_xy(pos: str, iw: int, ih: int, lw: int, lh: int, margin: int) -> tuple:
+    """Returns (x, y) top-left corner for logo placement given a position key."""
+    v_part = pos.split("-")[0]                  # "top", "mid", "bot"
+    h_part = pos.split("-")[1] if "-" in pos else "center"  # "left","center","right"
+    x = {"left": margin, "center": (iw - lw) // 2, "right": iw - lw - margin}[h_part]
+    y = {"top":  margin, "mid":    (ih - lh) // 2,  "bot":  ih - lh - margin}[v_part]
+    return max(0, x), max(0, y)
+
+
+def _composite_logo(img_bgr: '_np.ndarray', logo_bgra: '_np.ndarray',
+                    pos: str, width_frac: float = 0.15,
+                    margin_frac: float = 0.02) -> '_np.ndarray':
+    """Composites logo onto img_bgr at the given position key."""
+    ih, iw   = img_bgr.shape[:2]
+    lh0, lw0 = logo_bgra.shape[:2]
+    lw  = max(1, int(iw * width_frac))
+    lh  = max(1, int(lh0 * lw / max(1, lw0)))
+    logo = _cv2.resize(logo_bgra, (lw, lh), interpolation=_cv2.INTER_LANCZOS4)
+    margin = max(4, int(min(iw, ih) * margin_frac))
+    x, y = _logo_xy(pos, iw, ih, lw, lh, margin)
+    ye = min(y + lh, ih);  xe = min(x + lw, iw)
+    ah = ye - y;            aw = xe - x
+    out = img_bgr.astype(_np.float32)
+    roi = out[y:ye, x:xe]
+    wc  = logo[:ah, :aw]
     if wc.shape[2] == 4:
         a = wc[:, :, 3:4].astype(_np.float32) / 255.0
         c = wc[:, :, :3].astype(_np.float32)
@@ -424,6 +459,33 @@ QPushButton {
 QPushButton:hover   { background: #b06800; }
 QPushButton:pressed { background: #9a5a00; }
 """
+
+LOGO_ACTIVE_STYLE = """
+QPushButton {
+    background: #007b8a; color: #fff;
+    border: none; border-radius: 6px;
+    padding: 6px 16px; font-weight: bold;
+}
+QPushButton:hover   { background: #006778; }
+QPushButton:pressed { background: #005566; }
+"""
+
+_LOGO_POS_GRID = [
+    ("top-left",   "↖"), ("top-center",   "↑"), ("top-right",   "↗"),
+    ("mid-left",   "←"), ("mid-center",   "⊕"), ("mid-right",   "→"),
+    ("bot-left",   "↙"), ("bot-center",   "↓"), ("bot-right",   "↘"),
+]
+
+_LOGO_POS_STYLE = (
+    "QPushButton {"
+    " background:#2a2a2a; color:#bbb; border:1px solid #404040;"
+    " border-radius:4px; font-size:18px; font-weight:bold;"
+    "}"
+    "QPushButton:hover  { background:#3a3a3a; color:#eee; }"
+    "QPushButton:checked {"
+    " background:#007b8a; color:#fff; border-color:#007b8a;"
+    "}"
+)
 
 # ── Orientation-aware image loading ───────────────────────────────────────────
 
@@ -1583,6 +1645,88 @@ class WatermarkSetupDialog(QDialog):
         return self._paths
 
 
+# ── Logo position dialog ──────────────────────────────────────────────────────
+
+class LogoPositionDialog(QDialog):
+    def __init__(self, parent=None, pos_h: str = "bot-right", pos_v: str = "bot-right",
+                 size_h: int = 15, size_v: int = 15):
+        super().__init__(parent)
+        self.setWindowTitle("Posizione logo")
+        self.setModal(True)
+        self.setStyleSheet(BASE_STYLE)
+
+        self._pos_h = pos_h
+        self._pos_v = pos_v
+        self._btns: dict[str, dict] = {"h": {}, "v": {}}
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(16)
+        lay.setContentsMargins(18, 18, 18, 18)
+
+        grids_row = QHBoxLayout()
+        grids_row.setSpacing(24)
+
+        for axis, label, init_pos, init_size in (
+            ("h", "Foto orizzontali", pos_h, size_h),
+            ("v", "Foto verticali",   pos_v, size_v),
+        ):
+            col = QVBoxLayout()
+            col.setSpacing(8)
+
+            hdr = QLabel(label)
+            hdr.setStyleSheet("color:#ddd; font-weight:bold; font-size:13px;")
+            col.addWidget(hdr)
+
+            grid = QGridLayout()
+            grid.setSpacing(4)
+            for idx, (key, icon) in enumerate(_LOGO_POS_GRID):
+                btn = QPushButton(icon)
+                btn.setFixedSize(48, 48)
+                btn.setCheckable(True)
+                btn.setChecked(key == init_pos)
+                btn.setStyleSheet(_LOGO_POS_STYLE)
+                btn.setFocusPolicy(Qt.NoFocus)
+                btn.clicked.connect(lambda _, k=key, ax=axis: self._pick(ax, k))
+                self._btns[axis][key] = btn
+                grid.addWidget(btn, idx // 3, idx % 3)
+            col.addLayout(grid)
+
+            size_row = QHBoxLayout()
+            size_row.setSpacing(6)
+            size_row.addWidget(QLabel("Dimensione:"))
+            spin = QSpinBox()
+            spin.setRange(3, 60)
+            spin.setValue(init_size)
+            spin.setSuffix(" %")
+            spin.setFixedWidth(72)
+            setattr(self, f"_spin_{axis}", spin)
+            size_row.addWidget(spin)
+            size_row.addStretch()
+            col.addLayout(size_row)
+
+            grids_row.addLayout(col)
+
+        lay.addLayout(grids_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _pick(self, axis: str, key: str):
+        for k, btn in self._btns[axis].items():
+            btn.setChecked(k == key)
+        if axis == "h":
+            self._pos_h = key
+        else:
+            self._pos_v = key
+
+    def result_pos_h(self) -> str:   return self._pos_h
+    def result_pos_v(self) -> str:   return self._pos_v
+    def result_size_h(self) -> int:  return self._spin_h.value()
+    def result_size_v(self) -> int:  return self._spin_v.value()
+
+
 # ── Image view ────────────────────────────────────────────────────────────────
 
 class ImageView(QGraphicsView):
@@ -1608,7 +1752,11 @@ class ImageView(QGraphicsView):
         self._snake_timer   = QTimer(self)
         self._snake_timer.timeout.connect(self._snake_tick)
         self._wm_preview: QPixmap | None = None
-        self._wm_size_frac: float = 0.22
+        self._wm_size_frac_h: float = 0.22   # landscape
+        self._wm_size_frac_v: float = 0.22   # portrait
+        self._logo_preview: QPixmap | None = None
+        self._logo_pos:      str   = "bot-right"
+        self._logo_size_frac: float = 0.15
 
     # ── Watermark preview ─────────────────────────────────────────────────────
 
@@ -1616,8 +1764,15 @@ class ImageView(QGraphicsView):
         self._wm_preview = pixmap
         self.viewport().update()
 
-    def set_watermark_size(self, frac: float):
-        self._wm_size_frac = frac
+    def set_watermark_sizes(self, frac_h: float, frac_v: float):
+        self._wm_size_frac_h = frac_h
+        self._wm_size_frac_v = frac_v
+        self.viewport().update()
+
+    def set_logo_preview(self, pixmap: 'QPixmap | None', pos: str, size_frac: float):
+        self._logo_preview  = pixmap
+        self._logo_pos      = pos
+        self._logo_size_frac = size_frac
         self.viewport().update()
 
     def current_pixmap(self) -> 'QPixmap | None':
@@ -1658,8 +1813,9 @@ class ImageView(QGraphicsView):
     def drawForeground(self, painter, rect):
         has_tint  = self._tint_strength > 0.0
         has_snake = self._snake_active
-        has_wm    = self._wm_preview is not None and self._item is not None
-        if not has_tint and not has_snake and not has_wm:
+        has_wm    = self._wm_preview    is not None and self._item is not None
+        has_logo  = self._logo_preview  is not None and self._item is not None
+        if not has_tint and not has_snake and not has_wm and not has_logo:
             return
 
         painter.save()
@@ -1736,7 +1892,9 @@ class ImageView(QGraphicsView):
             ).boundingRect()
             iw = vp_rect.width()
             ih = vp_rect.height()
-            wm_w = max(1, int(iw * self._wm_size_frac))
+            px   = self._item.pixmap()
+            frac = self._wm_size_frac_h if px.width() >= px.height() else self._wm_size_frac_v
+            wm_w = max(1, int(iw * frac))
             wm_h = max(1, int(self._wm_preview.height() * wm_w
                                / max(1, self._wm_preview.width())))
             margin = max(1, int(ih * 0.03))
@@ -1746,6 +1904,24 @@ class ImageView(QGraphicsView):
                 wm_w, wm_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             painter.drawPixmap(wx, wy, scaled_wm)
+
+        if has_logo:
+            vp_rect = self.mapFromScene(
+                self._item.sceneBoundingRect()
+            ).boundingRect()
+            iw = int(vp_rect.width())
+            ih = int(vp_rect.height())
+            lw = max(1, int(iw * self._logo_size_frac))
+            lh = max(1, int(self._logo_preview.height() * lw
+                             / max(1, self._logo_preview.width())))
+            margin = max(1, int(min(iw, ih) * 0.02))
+            ox, oy = _logo_xy(self._logo_pos, iw, ih, lw, lh, margin)
+            lx = int(vp_rect.x()) + ox
+            ly = int(vp_rect.y()) + oy
+            scaled_logo = self._logo_preview.scaled(
+                lw, lh, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            painter.drawPixmap(lx, ly, scaled_logo)
 
         painter.restore()
 
@@ -2096,7 +2272,16 @@ class PhotoSelector(QMainWindow):
         self._discard_history: list[tuple[Path, Path, int]] = []
         self._space_press_idx: int = -1
         self._current_location: str = ""
-        self._watermark_enabled: bool = False
+        self.watermarked:   set[int]    = set()
+        # None=auto-select per photo, "dark"=force dark, "light"=force light
+        self._wm_override: str | None = None
+        self.logo_marked:   set[int]    = set()
+        self._logo_path:    str | None  = None
+        self._logo_bgra                 = None   # numpy array, loaded once per session
+        self._logo_pos_h:   str         = "bot-right"
+        self._logo_pos_v:   str         = "bot-right"
+        self._logo_size_h:  int         = 15
+        self._logo_size_v:  int         = 15
 
         self._space_timer = QTimer(self)
         self._space_timer.setSingleShot(True)
@@ -2124,15 +2309,13 @@ class PhotoSelector(QMainWindow):
             self.btn_info.setChecked(True)
             self._toggle_info()
 
-        # Restore watermark toggle state and size.
-        saved_pct = settings.get("watermark_size_pct", 22)
-        self.image_view.set_watermark_size(saved_pct / 100.0)
-        if settings.get("watermark_enabled", False):
-            wms = _load_watermarks()
-            if wms["dark"] or wms["light"]:
-                self._watermark_enabled = True
-                self.btn_watermark.setChecked(True)
-                self.btn_watermark.setStyleSheet(WATERMARK_ACTIVE_STYLE)
+        # Restore watermark sizes and color override.
+        self.image_view.set_watermark_sizes(
+            settings.get("watermark_size_pct_h", 22) / 100.0,
+            settings.get("watermark_size_pct_v", 22) / 100.0,
+        )
+        saved_ov = settings.get("wm_override", "off")
+        self._wm_override = None if saved_ov == "off" else saved_ov
 
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -2228,12 +2411,20 @@ class PhotoSelector(QMainWindow):
 
         self.btn_watermark = QPushButton("✍  Firma")
         self.btn_watermark.setFixedHeight(36)
-        self.btn_watermark.setCheckable(True)
         self.btn_watermark.setContextMenuPolicy(Qt.CustomContextMenu)
         self.btn_watermark.customContextMenuRequested.connect(self._watermark_context_menu)
         self.btn_watermark.setToolTip(
             "Applica la firma alle foto durante la copia\n"
             "Tasto destro → Modifica / Rimuovi firma"
+        )
+
+        self.btn_logo = QPushButton("🖼  Logo")
+        self.btn_logo.setFixedHeight(36)
+        self.btn_logo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_logo.customContextMenuRequested.connect(self._logo_context_menu)
+        self.btn_logo.setToolTip(
+            "Applica un logo alle foto durante la copia (sessione corrente)\n"
+            "Tasto destro → Cambia logo / Cambia posizione"
         )
 
         for w in [self.btn_open,
@@ -2242,7 +2433,7 @@ class PhotoSelector(QMainWindow):
                   _vsep(), self.btn_select, self.btn_copy, self.btn_share,
                   _vsep(), self.btn_info,
                   _vsep(), self.btn_rot_left, self.btn_rot_right, self.btn_crop,
-                  _vsep(), self.btn_watermark,
+                  _vsep(), self.btn_watermark, self.btn_logo,
                   _vsep(), self.btn_zout, self.btn_zreset, self.btn_zin]:
             if isinstance(w, QPushButton):
                 w.setFocusPolicy(Qt.NoFocus)
@@ -2330,6 +2521,7 @@ class PhotoSelector(QMainWindow):
         self.btn_rot_right.clicked.connect(lambda: self._rotate(clockwise=True))
         self.btn_crop.clicked.connect(self._crop_current)
         self.btn_watermark.clicked.connect(self._toggle_watermark)
+        self.btn_logo.clicked.connect(self._toggle_logo)
         self.btn_zin.clicked.connect(self.image_view.zoom_in)
         self.btn_zout.clicked.connect(self.image_view.zoom_out)
         self.btn_zreset.clicked.connect(self.image_view.zoom_reset)
@@ -2510,6 +2702,7 @@ class PhotoSelector(QMainWindow):
                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.filmstrip.set_thumbnail(index, thumb)
         self._update_watermark_preview()
+        self._update_logo_preview()
 
     def _on_exif_ready(self, index: int, info: dict):
         if index != self.current_index:
@@ -2801,20 +2994,28 @@ class PhotoSelector(QMainWindow):
     # ── Watermark ─────────────────────────────────────────────────────────────
 
     def _toggle_watermark(self):
+        if self.current_index < 0:
+            return
         wms = _load_watermarks()
         if not wms["dark"] and not wms["light"]:
-            self.btn_watermark.setChecked(False)
             self._watermark_setup()
             wms = _load_watermarks()
             if not wms["dark"] and not wms["light"]:
                 return
-            self.btn_watermark.setChecked(True)
-        self._watermark_enabled = self.btn_watermark.isChecked()
-        self.btn_watermark.setStyleSheet(
-            WATERMARK_ACTIVE_STYLE if self._watermark_enabled else ""
-        )
-        _save_settings({"watermark_enabled": self._watermark_enabled})
+        if self.current_index in self.watermarked:
+            self.watermarked.discard(self.current_index)
+        else:
+            self.watermarked.add(self.current_index)
+        self._apply_watermark_btn_style()
         self._update_watermark_preview()
+
+    def _apply_watermark_btn_style(self):
+        is_marked = self.current_index in self.watermarked
+        suffix = {"dark": "  (scura)", "light": "  (chiara)"}.get(self._wm_override or "", "")
+        self.btn_watermark.setText(
+            f"✍  Firmata{suffix}" if is_marked else f"✍  Firma{suffix}"
+        )
+        self.btn_watermark.setStyleSheet(WATERMARK_ACTIVE_STYLE if is_marked else "")
 
     def _watermark_setup(self):
         wms = _load_watermarks()
@@ -2833,17 +3034,42 @@ class PhotoSelector(QMainWindow):
     def _watermark_context_menu(self, pos):
         wms  = _load_watermarks()
         menu = QMenu(self)
-        act_edit      = menu.addAction("✍  Modifica firma...")
-        act_size      = menu.addAction("Dimensione firma...")
+        act_edit     = menu.addAction("✍  Modifica firma...")
+        act_size_h   = menu.addAction("Dimensione firma orizzontale...")
+        act_size_v   = menu.addAction("Dimensione firma verticale...")
         menu.addSeparator()
-        act_rm_dark   = menu.addAction("Rimuovi firma scura/singola") if wms["dark"]  else None
-        act_rm_light  = menu.addAction("Rimuovi firma chiara")        if wms["light"] else None
+        act_col_auto  = menu.addAction("Colore: Automatico")
+        act_col_dark  = menu.addAction("Colore: Scura")
+        act_col_light = menu.addAction("Colore: Chiara")
+        for act, key in ((act_col_auto, None), (act_col_dark, "dark"), (act_col_light, "light")):
+            act.setCheckable(True)
+            act.setChecked(self._wm_override == key)
+        menu.addSeparator()
+        act_rm_dark  = menu.addAction("Rimuovi firma scura/singola") if wms["dark"]  else None
+        act_rm_light = menu.addAction("Rimuovi firma chiara")        if wms["light"] else None
         chosen = menu.exec_(self.btn_watermark.mapToGlobal(pos))
         if chosen == act_edit:
             self._watermark_setup()
             self._update_watermark_preview()
-        elif chosen == act_size:
-            self._watermark_resize()
+        elif chosen == act_size_h:
+            self._watermark_resize("h")
+        elif chosen == act_size_v:
+            self._watermark_resize("v")
+        elif chosen == act_col_auto:
+            self._wm_override = None
+            self._apply_watermark_btn_style()
+            _save_settings({"wm_override": "off"})
+            self._update_watermark_preview()
+        elif chosen == act_col_dark:
+            self._wm_override = "dark"
+            self._apply_watermark_btn_style()
+            _save_settings({"wm_override": "dark"})
+            self._update_watermark_preview()
+        elif chosen == act_col_light:
+            self._wm_override = "light"
+            self._apply_watermark_btn_style()
+            _save_settings({"wm_override": "light"})
+            self._update_watermark_preview()
         elif act_rm_dark and chosen == act_rm_dark:
             (WATERMARK_DIR / "dark.png").unlink(missing_ok=True)
             self._update_watermark_preview()
@@ -2851,22 +3077,28 @@ class PhotoSelector(QMainWindow):
             (WATERMARK_DIR / "light.png").unlink(missing_ok=True)
             self._update_watermark_preview()
 
-    def _watermark_resize(self):
-        current_pct = int(_load_settings().get("watermark_size_pct", 22))
-        val, ok = QInputDialog.getInt(
-            self, "Dimensione firma",
-            "Larghezza firma (% della foto):",
-            current_pct, 5, 50, 1,
-        )
+    def _watermark_resize(self, orientation: str):
+        settings = _load_settings()
+        if orientation == "h":
+            key     = "watermark_size_pct_h"
+            label   = "Larghezza firma — foto orizzontali (% della foto):"
+            current = int(settings.get(key, 22))
+        else:
+            key     = "watermark_size_pct_v"
+            label   = "Larghezza firma — foto verticali (% della foto):"
+            current = int(settings.get(key, 22))
+        val, ok = QInputDialog.getInt(self, "Dimensione firma", label, current, 5, 50, 1)
         if not ok:
             return
-        frac = val / 100.0
-        _save_settings({"watermark_size_pct": val})
-        self.image_view.set_watermark_size(frac)
+        _save_settings({key: val})
+        self.image_view.set_watermark_sizes(
+            _load_settings().get("watermark_size_pct_h", 22) / 100.0,
+            _load_settings().get("watermark_size_pct_v", 22) / 100.0,
+        )
         self._update_watermark_preview()
 
     def _update_watermark_preview(self):
-        if not self._watermark_enabled or self.current_index < 0:
+        if self.current_index < 0 or self.current_index not in self.watermarked:
             self.image_view.set_watermark_preview(None)
             return
         wms = _load_watermarks()
@@ -2878,7 +3110,12 @@ class PhotoSelector(QMainWindow):
         if img is None:
             self.image_view.set_watermark_preview(None)
             return
-        wm_path = _pick_wm_path(img, wms)
+        if self._wm_override == "dark":
+            wm_path = wms["dark"] or wms["light"]
+        elif self._wm_override == "light":
+            wm_path = wms["light"] or wms["dark"]
+        else:
+            wm_path = _pick_wm_path(img, wms)
         if wm_path is None:
             self.image_view.set_watermark_preview(None)
             return
@@ -2894,6 +3131,93 @@ class PhotoSelector(QMainWindow):
             h, w = rgb.shape[:2]
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
         self.image_view.set_watermark_preview(QPixmap.fromImage(qimg.copy()))
+
+    # ── Logo ──────────────────────────────────────────────────────────────────
+
+    def _toggle_logo(self):
+        if self.current_index < 0:
+            return
+        if self._logo_path is None:
+            self._logo_setup()
+            if self._logo_path is None:
+                return
+        if self.current_index in self.logo_marked:
+            self.logo_marked.discard(self.current_index)
+        else:
+            self.logo_marked.add(self.current_index)
+        self._apply_logo_btn_style()
+        self._update_logo_preview()
+
+    def _logo_setup(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona logo PNG", "", "PNG (*.png)"
+        )
+        if not path:
+            return
+        dlg = LogoPositionDialog(
+            self,
+            pos_h=self._logo_pos_h, pos_v=self._logo_pos_v,
+            size_h=self._logo_size_h, size_v=self._logo_size_v,
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._logo_path    = path
+        self._logo_bgra    = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+        self._logo_pos_h   = dlg.result_pos_h()
+        self._logo_pos_v   = dlg.result_pos_v()
+        self._logo_size_h  = dlg.result_size_h()
+        self._logo_size_v  = dlg.result_size_v()
+
+    def _logo_context_menu(self, pos):
+        menu = QMenu(self)
+        act_change = menu.addAction("🖼  Cambia logo...")
+        act_pos    = menu.addAction("Cambia posizione...")
+        chosen = menu.exec_(self.btn_logo.mapToGlobal(pos))
+        if chosen == act_change:
+            old_path = self._logo_path
+            self._logo_path = None
+            self._logo_setup()
+            if self._logo_path is None:
+                self._logo_path = old_path  # restore if cancelled
+            self._update_logo_preview()
+        elif chosen == act_pos and self._logo_path:
+            dlg = LogoPositionDialog(
+                self,
+                pos_h=self._logo_pos_h, pos_v=self._logo_pos_v,
+                size_h=self._logo_size_h, size_v=self._logo_size_v,
+            )
+            if dlg.exec_() == QDialog.Accepted:
+                self._logo_pos_h  = dlg.result_pos_h()
+                self._logo_pos_v  = dlg.result_pos_v()
+                self._logo_size_h = dlg.result_size_h()
+                self._logo_size_v = dlg.result_size_v()
+                self._update_logo_preview()
+
+    def _apply_logo_btn_style(self):
+        is_marked = self.current_index in self.logo_marked
+        self.btn_logo.setText("🖼  Logo  ✓" if is_marked else "🖼  Logo")
+        self.btn_logo.setStyleSheet(LOGO_ACTIVE_STYLE if is_marked else "")
+
+    def _update_logo_preview(self):
+        if self.current_index < 0 or self.current_index not in self.logo_marked:
+            self.image_view.set_logo_preview(None, "bot-right", 0.15)
+            return
+        if self._logo_bgra is None:
+            self.image_view.set_logo_preview(None, "bot-right", 0.15)
+            return
+        px = self.image_view.current_pixmap()
+        is_h  = px is not None and px.width() >= px.height()
+        pos   = self._logo_pos_h   if is_h else self._logo_pos_v
+        frac  = self._logo_size_h  if is_h else self._logo_size_v
+        logo  = self._logo_bgra
+        if logo.shape[2] == 4:
+            h, w = logo.shape[:2]
+            qimg = QImage(logo.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        else:
+            rgb  = _cv2.cvtColor(logo, _cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        self.image_view.set_logo_preview(QPixmap.fromImage(qimg.copy()), pos, frac / 100.0)
 
     # ── Copy ──────────────────────────────────────────────────────────────────
 
@@ -2926,21 +3250,44 @@ class PhotoSelector(QMainWindow):
                     counter += 1
             try:
                 shutil.copy2(src, target)
-                if self._watermark_enabled:
+                if idx in self.watermarked:
                     try:
                         wms  = _load_watermarks()
                         img  = _cv2.imread(str(target))
                         if img is not None:
-                            wm_path = _pick_wm_path(img, wms)
+                            if self._wm_override == "dark":
+                                wm_path = wms["dark"] or wms["light"]
+                            elif self._wm_override == "light":
+                                wm_path = wms["light"] or wms["dark"]
+                            else:
+                                wm_path = _pick_wm_path(img, wms)
                             if wm_path:
                                 wm_bgra = _cv2.imread(str(wm_path), _cv2.IMREAD_UNCHANGED)
                                 if wm_bgra is not None:
-                                    frac   = self.image_view._wm_size_frac
+                                    ih, iw = img.shape[:2]
+                                    frac   = (self.image_view._wm_size_frac_h
+                                              if iw >= ih else
+                                              self.image_view._wm_size_frac_v)
                                     result = _composite_watermark(img, wm_bgra, width_frac=frac)
                                     ext    = target.suffix.lower()
                                     params = ([_cv2.IMWRITE_JPEG_QUALITY, 95]
                                               if ext in ('.jpg', '.jpeg') else [])
                                     _cv2.imwrite(str(target), result, params)
+                    except Exception:
+                        pass
+                if idx in self.logo_marked and self._logo_bgra is not None:
+                    try:
+                        img = _cv2.imread(str(target))
+                        if img is not None:
+                            ih2, iw2 = img.shape[:2]
+                            is_h  = iw2 >= ih2
+                            pos   = self._logo_pos_h  if is_h else self._logo_pos_v
+                            frac  = (self._logo_size_h if is_h else self._logo_size_v) / 100.0
+                            result = _composite_logo(img, self._logo_bgra, pos, frac)
+                            ext    = target.suffix.lower()
+                            params = ([_cv2.IMWRITE_JPEG_QUALITY, 95]
+                                      if ext in ('.jpg', '.jpeg') else [])
+                            _cv2.imwrite(str(target), result, params)
                     except Exception:
                         pass
                 copied += 1
@@ -3210,6 +3557,8 @@ class PhotoSelector(QMainWindow):
                     self.btn_img_prev, self.btn_img_next):
             btn.setEnabled(has)
         self.btn_select.setEnabled(cur)
+        self.btn_watermark.setEnabled(cur)
+        self.btn_logo.setEnabled(cur)
         self.btn_info.setEnabled(cur)
         self.btn_copy.setEnabled(n_sel > 0)
         self.btn_share.setEnabled(self._folder is not None)
@@ -3228,6 +3577,8 @@ class PhotoSelector(QMainWindow):
                 "★  Selezionata  [Space]" if is_sel else "☆  Seleziona  [Space]"
             )
             self.btn_select.setStyleSheet(SELECT_ACTIVE_STYLE if is_sel else "")
+            self._apply_watermark_btn_style()
+            self._apply_logo_btn_style()
             if is_sel:
                 self.image_view.start_snake()
             else:
