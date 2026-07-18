@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog, QProgressBar, QSlider,
     QListWidget, QListWidgetItem, QAbstractItemView,
     QStyledItemDelegate, QListView, QStyle,
-    QDialog, QLineEdit, QDialogButtonBox, QInputDialog,
+    QDialog, QLineEdit, QDialogButtonBox, QInputDialog, QMenu,
 )
 
 import cv2 as _cv2
@@ -89,6 +89,7 @@ FILEMAIL_BASE  = "https://www.filemail.com"
 FILEMAIL_CHUNK      = 25 * 1024 * 1024
 FILEMAIL_FREE_LIMIT = 5 * 1024 * 1024 * 1024   # 5 GB free-tier cap
 SETTINGS_PATH       = Path.home() / ".photoselector_settings.json"
+WATERMARK_DIR       = Path.home() / ".photoselector_watermarks"
 
 
 def _load_settings() -> dict:
@@ -112,6 +113,60 @@ def _fmt_size(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f} KB"
     return f"{n} B"
+
+
+# ── Watermark helpers ─────────────────────────────────────────────────────────
+
+def _load_watermarks() -> dict:
+    WATERMARK_DIR.mkdir(exist_ok=True)
+    return {
+        "dark":  (WATERMARK_DIR / "dark.png")  if (WATERMARK_DIR / "dark.png").exists()  else None,
+        "light": (WATERMARK_DIR / "light.png") if (WATERMARK_DIR / "light.png").exists() else None,
+    }
+
+
+def _pick_wm_path(img_bgr: '_np.ndarray', wms: dict) -> 'Path | None':
+    """Auto-selects dark or light watermark based on luminance of the bottom-center region."""
+    dark, light = wms.get("dark"), wms.get("light")
+    if dark is None and light is None:
+        return None
+    if dark is None:
+        return light
+    if light is None:
+        return dark
+    h, w = img_bgr.shape[:2]
+    region = img_bgr[int(h * 0.80):, int(w * 0.20):int(w * 0.80)]
+    gray   = _cv2.cvtColor(region, _cv2.COLOR_BGR2GRAY)
+    return dark if float(_np.mean(gray)) > 128 else light
+
+
+def _composite_watermark(img_bgr: '_np.ndarray', wm_bgra: '_np.ndarray',
+                          width_frac: float = 0.22, margin_frac: float = 0.03) -> '_np.ndarray':
+    """Composites watermark centered at the bottom of img_bgr."""
+    ih, iw   = img_bgr.shape[:2]
+    wh0, ww0 = wm_bgra.shape[:2]
+    wm_w = max(1, int(iw * width_frac))
+    wm_h = max(1, int(wh0 * wm_w / max(1, ww0)))
+    wm   = _cv2.resize(wm_bgra, (wm_w, wm_h), interpolation=_cv2.INTER_LANCZOS4)
+    margin = max(4, int(ih * margin_frac))
+    x  = (iw - wm_w) // 2
+    y  = max(0, ih - wm_h - margin)
+    ye = min(y + wm_h, ih)
+    xe = min(x + wm_w, iw)
+    ah = ye - y
+    aw = xe - x
+    out = img_bgr.astype(_np.float32)
+    roi = out[y:ye, x:xe]
+    wc  = wm[:ah, :aw]
+    if wc.shape[2] == 4:
+        a = wc[:, :, 3:4].astype(_np.float32) / 255.0
+        c = wc[:, :, :3].astype(_np.float32)
+    else:
+        a = _np.ones((ah, aw, 1), dtype=_np.float32)
+        c = wc.astype(_np.float32)
+    roi[:] = c * a + roi * (1.0 - a)
+    return out.astype(_np.uint8)
+
 
 # ── Crash logging + GitHub auto-reporting ─────────────────────────────────────
 
@@ -358,6 +413,16 @@ QPushButton {
 QPushButton:hover   { background: #7d50b8; }
 QPushButton:pressed { background: #4e2e7a; }
 QPushButton:disabled { background: #2a1e40; color: #666; }
+"""
+
+WATERMARK_ACTIVE_STYLE = """
+QPushButton {
+    background: #c87800; color: #fff;
+    border: none; border-radius: 6px;
+    padding: 6px 16px; font-weight: bold;
+}
+QPushButton:hover   { background: #b06800; }
+QPushButton:pressed { background: #9a5a00; }
 """
 
 # ── Orientation-aware image loading ───────────────────────────────────────────
@@ -1436,6 +1501,88 @@ class CropDialog(QDialog):
             super().keyPressEvent(event)
 
 
+# ── Watermark setup dialog ────────────────────────────────────────────────────
+
+class WatermarkSetupDialog(QDialog):
+    def __init__(self, parent=None, existing: dict = None):
+        super().__init__(parent)
+        self.setWindowTitle("Impostazioni firma")
+        self.setModal(True)
+        self.setStyleSheet(BASE_STYLE)
+        self.setMinimumWidth(500)
+
+        existing = existing or {}
+        self._paths = {
+            "dark":  str(existing.get("dark") or ""),
+            "light": str(existing.get("light") or ""),
+        }
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(14)
+        lay.setContentsMargins(18, 18, 18, 18)
+
+        info = QLabel(
+            "Puoi caricare una sola firma (usata sempre) oppure una versione scura "
+            "e una chiara: il programma sceglierà automaticamente quella con più "
+            "contrasto rispetto allo sfondo della foto."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #bbb; font-size: 12px; margin-bottom: 4px;")
+        lay.addWidget(info)
+
+        for key, label in (("dark", "Firma scura / singola"), ("light", "Firma chiara  (opzionale)")):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            btn_pick = QPushButton(f"📁  {label}")
+            btn_pick.setFixedHeight(32)
+            btn_pick.clicked.connect(lambda _, k=key: self._pick(k))
+            row.addWidget(btn_pick)
+
+            lbl = QLabel(self._paths[key] if self._paths[key] else "Nessuna")
+            lbl.setStyleSheet("color: #888; font-size: 11px;")
+            lbl.setWordWrap(True)
+            setattr(self, f"_lbl_{key}", lbl)
+            row.addWidget(lbl, 1)
+
+            btn_rm = QPushButton("✕")
+            btn_rm.setFixedSize(28, 32)
+            btn_rm.setToolTip("Rimuovi")
+            btn_rm.setEnabled(bool(self._paths[key]))
+            btn_rm.clicked.connect(lambda _, k=key: self._remove(k))
+            setattr(self, f"_btn_rm_{key}", btn_rm)
+            row.addWidget(btn_rm)
+
+            lay.addLayout(row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _pick(self, key: str):
+        path, _ = QFileDialog.getOpenFileName(self, "Seleziona firma PNG", "", "PNG (*.png)")
+        if not path:
+            return
+        self._paths[key] = path
+        getattr(self, f"_lbl_{key}").setText(path)
+        getattr(self, f"_btn_rm_{key}").setEnabled(True)
+
+    def _remove(self, key: str):
+        self._paths[key] = ""
+        label = "Nessuna"
+        getattr(self, f"_lbl_{key}").setText(label)
+        getattr(self, f"_btn_rm_{key}").setEnabled(False)
+
+    def _on_accept(self):
+        if not self._paths["dark"] and not self._paths["light"]:
+            QMessageBox.warning(self, "Firma richiesta", "Seleziona almeno una firma PNG.")
+            return
+        self.accept()
+
+    def paths(self) -> dict:
+        return self._paths
+
+
 # ── Image view ────────────────────────────────────────────────────────────────
 
 class ImageView(QGraphicsView):
@@ -1460,6 +1607,21 @@ class ImageView(QGraphicsView):
         self._snake_offset  = 0.0
         self._snake_timer   = QTimer(self)
         self._snake_timer.timeout.connect(self._snake_tick)
+        self._wm_preview: QPixmap | None = None
+        self._wm_size_frac: float = 0.22
+
+    # ── Watermark preview ─────────────────────────────────────────────────────
+
+    def set_watermark_preview(self, pixmap: 'QPixmap | None'):
+        self._wm_preview = pixmap
+        self.viewport().update()
+
+    def set_watermark_size(self, frac: float):
+        self._wm_size_frac = frac
+        self.viewport().update()
+
+    def current_pixmap(self) -> 'QPixmap | None':
+        return self._item.pixmap() if self._item else None
 
     # ── Tint property (animated by QPropertyAnimation) ────────────────────────
 
@@ -1491,12 +1653,13 @@ class ImageView(QGraphicsView):
         self._snake_offset += 0.75
         self.viewport().update()
 
-    # ── Overlay drawing (tint + snake) ────────────────────────────────────────
+    # ── Overlay drawing (tint + snake + watermark) ───────────────────────────
 
     def drawForeground(self, painter, rect):
         has_tint  = self._tint_strength > 0.0
         has_snake = self._snake_active
-        if not has_tint and not has_snake:
+        has_wm    = self._wm_preview is not None and self._item is not None
+        if not has_tint and not has_snake and not has_wm:
             return
 
         painter.save()
@@ -1566,6 +1729,23 @@ class ImageView(QGraphicsView):
             for phase in (0.0, perim_px * 0.5):
                 head_px = (tail_px + snake_len_px + phase) % perim_px
                 painter.drawEllipse(pt_on_rect(head_px), HEAD_R, HEAD_R)
+
+        if has_wm:
+            vp_rect = self.mapFromScene(
+                self._item.sceneBoundingRect()
+            ).boundingRect()
+            iw = vp_rect.width()
+            ih = vp_rect.height()
+            wm_w = max(1, int(iw * self._wm_size_frac))
+            wm_h = max(1, int(self._wm_preview.height() * wm_w
+                               / max(1, self._wm_preview.width())))
+            margin = max(1, int(ih * 0.03))
+            wx = int(vp_rect.x() + (iw - wm_w) / 2)
+            wy = int(vp_rect.y() + ih - wm_h - margin)
+            scaled_wm = self._wm_preview.scaled(
+                wm_w, wm_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            painter.drawPixmap(wx, wy, scaled_wm)
 
         painter.restore()
 
@@ -1916,6 +2096,7 @@ class PhotoSelector(QMainWindow):
         self._discard_history: list[tuple[Path, Path, int]] = []
         self._space_press_idx: int = -1
         self._current_location: str = ""
+        self._watermark_enabled: bool = False
 
         self._space_timer = QTimer(self)
         self._space_timer.setSingleShot(True)
@@ -1942,6 +2123,16 @@ class PhotoSelector(QMainWindow):
         if settings.get("info_panel_open", False):
             self.btn_info.setChecked(True)
             self._toggle_info()
+
+        # Restore watermark toggle state and size.
+        saved_pct = settings.get("watermark_size_pct", 22)
+        self.image_view.set_watermark_size(saved_pct / 100.0)
+        if settings.get("watermark_enabled", False):
+            wms = _load_watermarks()
+            if wms["dark"] or wms["light"]:
+                self._watermark_enabled = True
+                self.btn_watermark.setChecked(True)
+                self.btn_watermark.setStyleSheet(WATERMARK_ACTIVE_STYLE)
 
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -2035,12 +2226,23 @@ class PhotoSelector(QMainWindow):
         self.btn_zin   = QPushButton("+")
         self.btn_zin.setFixedSize(36, 36)
 
+        self.btn_watermark = QPushButton("✍  Firma")
+        self.btn_watermark.setFixedHeight(36)
+        self.btn_watermark.setCheckable(True)
+        self.btn_watermark.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_watermark.customContextMenuRequested.connect(self._watermark_context_menu)
+        self.btn_watermark.setToolTip(
+            "Applica la firma alle foto durante la copia\n"
+            "Tasto destro → Modifica / Rimuovi firma"
+        )
+
         for w in [self.btn_open,
                   _vsep(), self.btn_prev, self.lbl_counter, self.btn_next,
                   _vsep(), self.lbl_name,
                   _vsep(), self.btn_select, self.btn_copy, self.btn_share,
                   _vsep(), self.btn_info,
                   _vsep(), self.btn_rot_left, self.btn_rot_right, self.btn_crop,
+                  _vsep(), self.btn_watermark,
                   _vsep(), self.btn_zout, self.btn_zreset, self.btn_zin]:
             if isinstance(w, QPushButton):
                 w.setFocusPolicy(Qt.NoFocus)
@@ -2127,6 +2329,7 @@ class PhotoSelector(QMainWindow):
         self.btn_rot_left.clicked.connect(lambda: self._rotate(clockwise=False))
         self.btn_rot_right.clicked.connect(lambda: self._rotate(clockwise=True))
         self.btn_crop.clicked.connect(self._crop_current)
+        self.btn_watermark.clicked.connect(self._toggle_watermark)
         self.btn_zin.clicked.connect(self.image_view.zoom_in)
         self.btn_zout.clicked.connect(self.image_view.zoom_out)
         self.btn_zreset.clicked.connect(self.image_view.zoom_reset)
@@ -2306,6 +2509,7 @@ class PhotoSelector(QMainWindow):
                 thumb = px.scaled(THUMB_W, THUMB_H,
                                   Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.filmstrip.set_thumbnail(index, thumb)
+        self._update_watermark_preview()
 
     def _on_exif_ready(self, index: int, info: dict):
         if index != self.current_index:
@@ -2594,6 +2798,103 @@ class PhotoSelector(QMainWindow):
         self._dest_folder = name.strip() or DEST_FOLDER
         self._sync_ui()
 
+    # ── Watermark ─────────────────────────────────────────────────────────────
+
+    def _toggle_watermark(self):
+        wms = _load_watermarks()
+        if not wms["dark"] and not wms["light"]:
+            self.btn_watermark.setChecked(False)
+            self._watermark_setup()
+            wms = _load_watermarks()
+            if not wms["dark"] and not wms["light"]:
+                return
+            self.btn_watermark.setChecked(True)
+        self._watermark_enabled = self.btn_watermark.isChecked()
+        self.btn_watermark.setStyleSheet(
+            WATERMARK_ACTIVE_STYLE if self._watermark_enabled else ""
+        )
+        _save_settings({"watermark_enabled": self._watermark_enabled})
+        self._update_watermark_preview()
+
+    def _watermark_setup(self):
+        wms = _load_watermarks()
+        dlg = WatermarkSetupDialog(self, existing=wms)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        WATERMARK_DIR.mkdir(exist_ok=True)
+        for key in ("dark", "light"):
+            src  = dlg.paths().get(key, "")
+            dest = WATERMARK_DIR / f"{key}.png"
+            if src:
+                shutil.copy2(src, dest)
+            elif dest.exists():
+                dest.unlink()
+
+    def _watermark_context_menu(self, pos):
+        wms  = _load_watermarks()
+        menu = QMenu(self)
+        act_edit      = menu.addAction("✍  Modifica firma...")
+        act_size      = menu.addAction("Dimensione firma...")
+        menu.addSeparator()
+        act_rm_dark   = menu.addAction("Rimuovi firma scura/singola") if wms["dark"]  else None
+        act_rm_light  = menu.addAction("Rimuovi firma chiara")        if wms["light"] else None
+        chosen = menu.exec_(self.btn_watermark.mapToGlobal(pos))
+        if chosen == act_edit:
+            self._watermark_setup()
+            self._update_watermark_preview()
+        elif chosen == act_size:
+            self._watermark_resize()
+        elif act_rm_dark and chosen == act_rm_dark:
+            (WATERMARK_DIR / "dark.png").unlink(missing_ok=True)
+            self._update_watermark_preview()
+        elif act_rm_light and chosen == act_rm_light:
+            (WATERMARK_DIR / "light.png").unlink(missing_ok=True)
+            self._update_watermark_preview()
+
+    def _watermark_resize(self):
+        current_pct = int(_load_settings().get("watermark_size_pct", 22))
+        val, ok = QInputDialog.getInt(
+            self, "Dimensione firma",
+            "Larghezza firma (% della foto):",
+            current_pct, 5, 50, 1,
+        )
+        if not ok:
+            return
+        frac = val / 100.0
+        _save_settings({"watermark_size_pct": val})
+        self.image_view.set_watermark_size(frac)
+        self._update_watermark_preview()
+
+    def _update_watermark_preview(self):
+        if not self._watermark_enabled or self.current_index < 0:
+            self.image_view.set_watermark_preview(None)
+            return
+        wms = _load_watermarks()
+        if not wms["dark"] and not wms["light"]:
+            self.image_view.set_watermark_preview(None)
+            return
+        path = self.photos[self.current_index]
+        img  = _cv2.imread(str(path))
+        if img is None:
+            self.image_view.set_watermark_preview(None)
+            return
+        wm_path = _pick_wm_path(img, wms)
+        if wm_path is None:
+            self.image_view.set_watermark_preview(None)
+            return
+        wm_bgra = _cv2.imread(str(wm_path), _cv2.IMREAD_UNCHANGED)
+        if wm_bgra is None:
+            self.image_view.set_watermark_preview(None)
+            return
+        if wm_bgra.shape[2] == 4:
+            h, w = wm_bgra.shape[:2]
+            qimg = QImage(wm_bgra.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        else:
+            rgb  = _cv2.cvtColor(wm_bgra, _cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        self.image_view.set_watermark_preview(QPixmap.fromImage(qimg.copy()))
+
     # ── Copy ──────────────────────────────────────────────────────────────────
 
     def _copy_selected(self):
@@ -2625,6 +2926,23 @@ class PhotoSelector(QMainWindow):
                     counter += 1
             try:
                 shutil.copy2(src, target)
+                if self._watermark_enabled:
+                    try:
+                        wms  = _load_watermarks()
+                        img  = _cv2.imread(str(target))
+                        if img is not None:
+                            wm_path = _pick_wm_path(img, wms)
+                            if wm_path:
+                                wm_bgra = _cv2.imread(str(wm_path), _cv2.IMREAD_UNCHANGED)
+                                if wm_bgra is not None:
+                                    frac   = self.image_view._wm_size_frac
+                                    result = _composite_watermark(img, wm_bgra, width_frac=frac)
+                                    ext    = target.suffix.lower()
+                                    params = ([_cv2.IMWRITE_JPEG_QUALITY, 95]
+                                              if ext in ('.jpg', '.jpeg') else [])
+                                    _cv2.imwrite(str(target), result, params)
+                    except Exception:
+                        pass
                 copied += 1
             except Exception as e:
                 errors.append(f"{src.name}: {e}")
