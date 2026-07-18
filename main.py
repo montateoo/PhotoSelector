@@ -35,7 +35,7 @@ from PIL.ExifTags import TAGS, GPSTAGS
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QHBoxLayout, QVBoxLayout, QFileDialog, QScrollArea,
+    QHBoxLayout, QVBoxLayout, QGridLayout, QFileDialog, QScrollArea,
     QSizePolicy, QStatusBar, QFrame, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QMessageBox,
     QProgressDialog, QProgressBar, QSlider,
@@ -1756,9 +1756,7 @@ class ImageView(QGraphicsView):
         self._wm_preview: QPixmap | None = None
         self._wm_size_frac_h: float = 0.22   # landscape
         self._wm_size_frac_v: float = 0.22   # portrait
-        self._logo_preview: QPixmap | None = None
-        self._logo_pos:      str   = "bot-right"
-        self._logo_size_frac: float = 0.15
+        self._logo_previews: list = []   # list of (QPixmap, pos, size_frac)
 
     # ── Watermark preview ─────────────────────────────────────────────────────
 
@@ -1771,10 +1769,8 @@ class ImageView(QGraphicsView):
         self._wm_size_frac_v = frac_v
         self.viewport().update()
 
-    def set_logo_preview(self, pixmap: 'QPixmap | None', pos: str, size_frac: float):
-        self._logo_preview  = pixmap
-        self._logo_pos      = pos
-        self._logo_size_frac = size_frac
+    def set_logo_previews(self, logos: list):
+        self._logo_previews = logos   # list of (QPixmap, pos, size_frac)
         self.viewport().update()
 
     def current_pixmap(self) -> 'QPixmap | None':
@@ -1815,8 +1811,8 @@ class ImageView(QGraphicsView):
     def drawForeground(self, painter, rect):
         has_tint  = self._tint_strength > 0.0
         has_snake = self._snake_active
-        has_wm    = self._wm_preview    is not None and self._item is not None
-        has_logo  = self._logo_preview  is not None and self._item is not None
+        has_wm    = self._wm_preview  is not None and self._item is not None
+        has_logo  = bool(self._logo_previews) and self._item is not None
         if not has_tint and not has_snake and not has_wm and not has_logo:
             return
 
@@ -1913,17 +1909,13 @@ class ImageView(QGraphicsView):
             ).boundingRect()
             iw = int(vp_rect.width())
             ih = int(vp_rect.height())
-            lw = max(1, int(iw * self._logo_size_frac))
-            lh = max(1, int(self._logo_preview.height() * lw
-                             / max(1, self._logo_preview.width())))
             margin = max(1, int(min(iw, ih) * 0.02))
-            ox, oy = _logo_xy(self._logo_pos, iw, ih, lw, lh, margin)
-            lx = int(vp_rect.x()) + ox
-            ly = int(vp_rect.y()) + oy
-            scaled_logo = self._logo_preview.scaled(
-                lw, lh, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            painter.drawPixmap(lx, ly, scaled_logo)
+            for logo_px, logo_pos, logo_frac in self._logo_previews:
+                lw = max(1, int(iw * logo_frac))
+                lh = max(1, int(logo_px.height() * lw / max(1, logo_px.width())))
+                ox, oy = _logo_xy(logo_pos, iw, ih, lw, lh, margin)
+                scaled_logo = logo_px.scaled(lw, lh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawPixmap(int(vp_rect.x()) + ox, int(vp_rect.y()) + oy, scaled_logo)
 
         painter.restore()
 
@@ -2301,13 +2293,10 @@ class PhotoSelector(QMainWindow):
         self._wm_override: str | None = None
         # per-photo click-override: {idx: "dark" | "light"}; absent = use auto
         self._wm_photo_override: dict[int, str] = {}
-        self.logo_marked:   set[int]    = set()
-        self._logo_path:    str | None  = None
-        self._logo_bgra                 = None   # numpy array, loaded once per session
-        self._logo_pos_h:   str         = "bot-right"
-        self._logo_pos_v:   str         = "bot-right"
-        self._logo_size_h:  int         = 15
-        self._logo_size_v:  int         = 15
+        self._logo_enabled: bool = False
+        self._logos: list        = []
+        # Each entry: {"path": str, "bgra": ndarray, "pos_h": str, "pos_v": str,
+        #              "size_h": int, "size_v": int}
 
         self._space_timer = QTimer(self)
         self._space_timer.setSingleShot(True)
@@ -3189,86 +3178,102 @@ class PhotoSelector(QMainWindow):
     # ── Logo ──────────────────────────────────────────────────────────────────
 
     def _toggle_logo(self):
-        if self.current_index < 0:
-            return
-        if self._logo_path is None:
-            self._logo_setup()
-            if self._logo_path is None:
+        if not self._logos:
+            self._logo_add()
+            if not self._logos:
                 return
-        if self.current_index in self.logo_marked:
-            self.logo_marked.discard(self.current_index)
+            self._logo_enabled = True
         else:
-            self.logo_marked.add(self.current_index)
+            self._logo_enabled = not self._logo_enabled
         self._apply_logo_btn_style()
         self._update_logo_preview()
 
-    def _logo_setup(self):
+    def _logo_add(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Seleziona logo PNG", "", "PNG (*.png)"
         )
         if not path:
             return
-        dlg = LogoPositionDialog(
-            self,
-            pos_h=self._logo_pos_h, pos_v=self._logo_pos_v,
-            size_h=self._logo_size_h, size_v=self._logo_size_v,
-        )
+        dlg = LogoPositionDialog(self, pos_h="bot-right", pos_v="bot-right",
+                                 size_h=15, size_v=15)
         if dlg.exec_() != QDialog.Accepted:
             return
-        self._logo_path    = path
-        raw = _np.fromfile(path, dtype=_np.uint8)
-        self._logo_bgra    = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
-        self._logo_pos_h   = dlg.result_pos_h()
-        self._logo_pos_v   = dlg.result_pos_v()
-        self._logo_size_h  = dlg.result_size_h()
-        self._logo_size_v  = dlg.result_size_v()
+        raw  = _np.fromfile(path, dtype=_np.uint8)
+        bgra = _cv2.imdecode(raw, _cv2.IMREAD_UNCHANGED)
+        self._logos.append({
+            "path":  path,
+            "bgra":  bgra,
+            "pos_h": dlg.result_pos_h(),
+            "pos_v": dlg.result_pos_v(),
+            "size_h": dlg.result_size_h(),
+            "size_v": dlg.result_size_v(),
+        })
 
     def _logo_context_menu(self, pos):
-        menu = QMenu(self)
-        act_change = menu.addAction("🖼  Cambia logo...")
-        act_pos    = menu.addAction("Cambia posizione...")
+        menu     = QMenu(self)
+        act_add  = menu.addAction("➕  Aggiungi logo...")
+        logo_acts = []
+        if self._logos:
+            menu.addSeparator()
+            for i, logo in enumerate(self._logos):
+                name = Path(logo["path"]).name
+                sub      = menu.addMenu(f"Logo {i + 1} – {name}")
+                act_pos  = sub.addAction("Cambia posizione...")
+                act_rm   = sub.addAction("Rimuovi")
+                logo_acts.append((act_pos, act_rm, i))
         chosen = menu.exec_(self.btn_logo.mapToGlobal(pos))
-        if chosen == act_change:
-            old_path = self._logo_path
-            self._logo_path = None
-            self._logo_setup()
-            if self._logo_path is None:
-                self._logo_path = old_path  # restore if cancelled
+        if chosen == act_add:
+            self._logo_add()
+            if self._logos and not self._logo_enabled:
+                self._logo_enabled = True
+            self._apply_logo_btn_style()
             self._update_logo_preview()
-        elif chosen == act_pos and self._logo_path:
-            dlg = LogoPositionDialog(
-                self,
-                pos_h=self._logo_pos_h, pos_v=self._logo_pos_v,
-                size_h=self._logo_size_h, size_v=self._logo_size_v,
-            )
-            if dlg.exec_() == QDialog.Accepted:
-                self._logo_pos_h  = dlg.result_pos_h()
-                self._logo_pos_v  = dlg.result_pos_v()
-                self._logo_size_h = dlg.result_size_h()
-                self._logo_size_v = dlg.result_size_v()
-                self._update_logo_preview()
+        else:
+            for act_pos, act_rm, i in logo_acts:
+                if chosen == act_pos:
+                    logo = self._logos[i]
+                    dlg  = LogoPositionDialog(self, pos_h=logo["pos_h"], pos_v=logo["pos_v"],
+                                              size_h=logo["size_h"], size_v=logo["size_v"])
+                    if dlg.exec_() == QDialog.Accepted:
+                        logo["pos_h"]  = dlg.result_pos_h()
+                        logo["pos_v"]  = dlg.result_pos_v()
+                        logo["size_h"] = dlg.result_size_h()
+                        logo["size_v"] = dlg.result_size_v()
+                        self._update_logo_preview()
+                    break
+                if chosen == act_rm:
+                    self._logos.pop(i)
+                    if not self._logos:
+                        self._logo_enabled = False
+                    self._apply_logo_btn_style()
+                    self._update_logo_preview()
+                    break
 
     def _apply_logo_btn_style(self):
-        is_marked = self.current_index in self.logo_marked
-        self.btn_logo.setText("🖼  Logo  ✓" if is_marked else "🖼  Logo")
-        self.btn_logo.setStyleSheet(LOGO_ACTIVE_STYLE if is_marked else "")
+        n      = len(self._logos)
+        suffix = f" ({n})" if n > 1 else ""
+        check  = "  ✓" if self._logo_enabled else ""
+        self.btn_logo.setText(f"🖼  Logo{suffix}{check}")
+        self.btn_logo.setStyleSheet(LOGO_ACTIVE_STYLE if self._logo_enabled else "")
 
     def _update_logo_preview(self):
-        if self.current_index < 0 or self.current_index not in self.logo_marked:
-            self.image_view.set_logo_preview(None, "bot-right", 0.15)
+        if (not self._logo_enabled
+                or self.current_index < 0
+                or self.current_index not in self.selected
+                or not self._logos):
+            self.image_view.set_logo_previews([])
             return
-        if self._logo_path is None:
-            self.image_view.set_logo_preview(None, "bot-right", 0.15)
-            return
-        px = self.image_view.current_pixmap()
-        is_h    = px is not None and px.width() >= px.height()
-        pos     = self._logo_pos_h  if is_h else self._logo_pos_v
-        frac    = self._logo_size_h if is_h else self._logo_size_v
-        logo_px = QPixmap(self._logo_path)
-        if logo_px.isNull():
-            self.image_view.set_logo_preview(None, "bot-right", 0.15)
-            return
-        self.image_view.set_logo_preview(logo_px, pos, frac / 100.0)
+        px   = self.image_view.current_pixmap()
+        is_h = px is not None and px.width() >= px.height()
+        previews = []
+        for logo in self._logos:
+            logo_px = QPixmap(logo["path"])
+            if logo_px.isNull():
+                continue
+            pos  = logo["pos_h"] if is_h else logo["pos_v"]
+            frac = (logo["size_h"] if is_h else logo["size_v"]) / 100.0
+            previews.append((logo_px, pos, frac))
+        self.image_view.set_logo_previews(previews)
 
     # ── Copy ──────────────────────────────────────────────────────────────────
 
@@ -3331,19 +3336,22 @@ class PhotoSelector(QMainWindow):
                                     _cv2.imwrite(str(target), result, params)
                     except Exception:
                         pass
-                if idx in self.logo_marked and self._logo_bgra is not None:
+                if self._logo_enabled and self._logos:
                     try:
                         img = _cv2.imread(str(target))
                         if img is not None:
                             ih2, iw2 = img.shape[:2]
-                            is_h  = iw2 >= ih2
-                            pos   = self._logo_pos_h  if is_h else self._logo_pos_v
-                            frac  = (self._logo_size_h if is_h else self._logo_size_v) / 100.0
-                            result = _composite_logo(img, self._logo_bgra, pos, frac)
+                            is_h = iw2 >= ih2
+                            for logo in self._logos:
+                                if logo["bgra"] is None:
+                                    continue
+                                pos    = logo["pos_h"] if is_h else logo["pos_v"]
+                                frac   = (logo["size_h"] if is_h else logo["size_v"]) / 100.0
+                                img    = _composite_logo(img, logo["bgra"], pos, frac)
                             ext    = target.suffix.lower()
                             params = ([_cv2.IMWRITE_JPEG_QUALITY, 95]
                                       if ext in ('.jpg', '.jpeg') else [])
-                            _cv2.imwrite(str(target), result, params)
+                            _cv2.imwrite(str(target), img, params)
                     except Exception:
                         pass
                 copied += 1
@@ -3636,6 +3644,7 @@ class PhotoSelector(QMainWindow):
             self._apply_watermark_btn_style()
             self._apply_logo_btn_style()
             self._update_watermark_preview()
+            self._update_logo_preview()
             if is_sel:
                 self.image_view.start_snake()
             else:
