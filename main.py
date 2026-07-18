@@ -3180,18 +3180,11 @@ class PhotoSelector(QMainWindow):
         if wm_path is None:
             self.image_view.set_watermark_preview(None)
             return
-        wm_bgra = _cv2.imread(str(wm_path), _cv2.IMREAD_UNCHANGED)
-        if wm_bgra is None:
+        wm_px = QPixmap(str(wm_path))
+        if wm_px.isNull():
             self.image_view.set_watermark_preview(None)
             return
-        if wm_bgra.shape[2] == 4:
-            h, w = wm_bgra.shape[:2]
-            qimg = QImage(wm_bgra.data, w, h, 4 * w, QImage.Format_RGBA8888)
-        else:
-            rgb  = _cv2.cvtColor(wm_bgra, _cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-        self.image_view.set_watermark_preview(QPixmap.fromImage(qimg.copy()))
+        self.image_view.set_watermark_preview(wm_px)
 
     # ── Logo ──────────────────────────────────────────────────────────────────
 
@@ -3264,22 +3257,18 @@ class PhotoSelector(QMainWindow):
         if self.current_index < 0 or self.current_index not in self.logo_marked:
             self.image_view.set_logo_preview(None, "bot-right", 0.15)
             return
-        if self._logo_bgra is None:
+        if self._logo_path is None:
             self.image_view.set_logo_preview(None, "bot-right", 0.15)
             return
         px = self.image_view.current_pixmap()
-        is_h  = px is not None and px.width() >= px.height()
-        pos   = self._logo_pos_h   if is_h else self._logo_pos_v
-        frac  = self._logo_size_h  if is_h else self._logo_size_v
-        logo  = self._logo_bgra
-        if logo.shape[2] == 4:
-            h, w = logo.shape[:2]
-            qimg = QImage(logo.data, w, h, 4 * w, QImage.Format_RGBA8888)
-        else:
-            rgb  = _cv2.cvtColor(logo, _cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-        self.image_view.set_logo_preview(QPixmap.fromImage(qimg.copy()), pos, frac / 100.0)
+        is_h    = px is not None and px.width() >= px.height()
+        pos     = self._logo_pos_h  if is_h else self._logo_pos_v
+        frac    = self._logo_size_h if is_h else self._logo_size_v
+        logo_px = QPixmap(self._logo_path)
+        if logo_px.isNull():
+            self.image_view.set_logo_preview(None, "bot-right", 0.15)
+            return
+        self.image_view.set_logo_preview(logo_px, pos, frac / 100.0)
 
     # ── Copy ──────────────────────────────────────────────────────────────────
 
