@@ -27,7 +27,13 @@ import faulthandler
 import urllib.request
 import urllib.parse
 import urllib.error
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:      # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 from pathlib import Path
 
 from PIL import Image as PilImage, ImageOps as PilImageOps
@@ -489,8 +495,10 @@ _LOGO_POS_STYLE = (
 
 # ── Orientation-aware image loading ───────────────────────────────────────────
 
-def _load_oriented_pixmap(path: Path, max_size: tuple[int, int] | None = None) -> QPixmap:
+def _load_oriented_image(path: Path, max_size: tuple[int, int] | None = None) -> QImage:
     """Loads an image applying its EXIF orientation tag (QPixmap alone ignores it).
+
+    Returns a QImage: unlike QPixmap it is safe to create off the GUI thread.
 
     When max_size is given, uses PIL's JPEG draft mode to downscale during
     decode instead of after — this keeps thumbnail generation for large photo
@@ -510,10 +518,15 @@ def _load_oriented_pixmap(path: Path, max_size: tuple[int, int] | None = None) -
             fmt  = QImage.Format_RGBA8888 if img.mode == "RGBA" else QImage.Format_RGB888
             stride = (4 if img.mode == "RGBA" else 3) * w
             qimg = QImage(data, w, h, stride, fmt)
-            return QPixmap.fromImage(qimg.copy())
+            return qimg.copy()
     except Exception as e:
         log.warning(f"Orientation-aware load failed for {path.name}: {e}")
-        return QPixmap(str(path))
+        return QImage(str(path))
+
+
+def _load_oriented_pixmap(path: Path, max_size: tuple[int, int] | None = None) -> QPixmap:
+    """GUI-thread only: QPixmap version of _load_oriented_image."""
+    return QPixmap.fromImage(_load_oriented_image(path, max_size))
 
 
 # ── EXIF utilities ────────────────────────────────────────────────────────────
@@ -609,7 +622,7 @@ def read_photo_info(path: Path) -> dict:
 # ── Background workers ────────────────────────────────────────────────────────
 
 class ThumbnailLoader(QThread):
-    ready    = pyqtSignal(int, QPixmap)
+    ready    = pyqtSignal(int, QImage)
     progress = pyqtSignal(int)          # number of thumbs processed so far
 
     def __init__(self, photos: list[Path]):
@@ -629,13 +642,13 @@ class ThumbnailLoader(QThread):
                 if i > 0:
                     self.msleep(5)    # let the main thread drain queued signals
             try:
-                px = _load_oriented_pixmap(path, max_size=(THUMB_W * 2, THUMB_H * 2))
-                if not px.isNull():
-                    thumb = px.scaled(THUMB_W, THUMB_H,
-                                      Qt.KeepAspectRatio,
-                                      Qt.SmoothTransformation)
+                img = _load_oriented_image(path, max_size=(THUMB_W * 2, THUMB_H * 2))
+                if not img.isNull():
+                    thumb = img.scaled(THUMB_W, THUMB_H,
+                                       Qt.KeepAspectRatio,
+                                       Qt.SmoothTransformation)
                     self.ready.emit(i, thumb)
-                del px
+                del img
             except MemoryError:
                 log.error(f"Out of memory generating thumbnail for {path.name} — skipping")
             except Exception as e:
@@ -647,7 +660,7 @@ class ThumbnailLoader(QThread):
 
 
 class ImageLoader(QThread):
-    ready = pyqtSignal(int, QPixmap)
+    ready = pyqtSignal(int, QImage)
 
     def __init__(self, index: int, path: Path):
         super().__init__()
@@ -656,10 +669,10 @@ class ImageLoader(QThread):
 
     def run(self):
         try:
-            self.ready.emit(self.index, _load_oriented_pixmap(self.path))
+            self.ready.emit(self.index, _load_oriented_image(self.path))
         except Exception as e:
             log.error(f"Image load failed for {self.path.name}: {e}")
-            self.ready.emit(self.index, QPixmap())
+            self.ready.emit(self.index, QImage())
 
 
 class ExifLoader(QThread):
@@ -1058,7 +1071,10 @@ class FilmStrip(QListWidget):
             item.setSizeHint(QSize(THUMB_W + 8, THUMB_H + 8))
             self.addItem(item)
 
-    def set_thumbnail(self, index: int, px: QPixmap):
+    def set_thumbnail(self, index: int, px):
+        # Loader threads emit QImage (thread-safe); QPixmap only exists here.
+        if isinstance(px, QImage):
+            px = QPixmap.fromImage(px)
         item = self.item(index)
         if item:
             item.setIcon(QIcon(px))
@@ -2261,6 +2277,7 @@ class PhotoSelector(QMainWindow):
         self.selected: set[int]  = set()
         self._folder: Path | None = None
 
+        self._retired_loaders: list = []
         self._thumb_loader:   ThumbnailLoader | None  = None
         self._img_loader:     ImageLoader | None       = None
         self._exif_loader:    ExifLoader | None        = None
@@ -2551,6 +2568,12 @@ class PhotoSelector(QMainWindow):
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        if self._thumb_loader and self._thumb_loader.isRunning():
+            self._thumb_loader.stop()
+        for l in (self._thumb_loader, self._img_loader, self._exif_loader,
+                  self._geo_loader, *self._retired_loaders):
+            if l is not None and l.isRunning():
+                l.wait(5000)
         _mark_clean_exit()
         super().closeEvent(event)
 
@@ -2675,10 +2698,8 @@ class PhotoSelector(QMainWindow):
         _set_action("navigating", self.photos[index].name)
 
         # Cancel any in-flight loaders from a previous navigation.
-        if self._img_loader and self._img_loader.isRunning():
-            self._img_loader.quit()
-        if self._exif_loader and self._exif_loader.isRunning():
-            self._exif_loader.quit()
+        self._retire_loader(self._img_loader)
+        self._retire_loader(self._exif_loader)
         self.info_panel.clear()
 
         # Restart the debounce timer. If another _go_to fires within 150 ms
@@ -2706,9 +2727,24 @@ class PhotoSelector(QMainWindow):
                 "last_index":  index,
             })
 
-    def _on_image_ready(self, index: int, px: QPixmap):
+    def _retire_loader(self, loader):
+        """Detach a still-running worker and keep it alive until it finishes:
+        destroying a running QThread aborts the process natively."""
+        if loader is None or not loader.isRunning():
+            return
+        try:
+            loader.ready.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self._retired_loaders.append(loader)
+        loader.finished.connect(
+            lambda l=loader: self._retired_loaders.remove(l)
+            if l in self._retired_loaders else None)
+
+    def _on_image_ready(self, index: int, img: QImage):
         if index != self.current_index:
             return
+        px = QPixmap.fromImage(img)
         if px.isNull():
             self.image_view.show_placeholder(
                 f"Impossibile caricare: {self.photos[index].name}"
@@ -2733,8 +2769,7 @@ class PhotoSelector(QMainWindow):
         lat = info.get("gps_lat")
         lon = info.get("gps_lon")
         if lat is not None and lon is not None:
-            if self._geo_loader and self._geo_loader.isRunning():
-                self._geo_loader.quit()
+            self._retire_loader(self._geo_loader)
             self._geo_loader = GeocoderThread(lat, lon)
             self._geo_loader.ready.connect(
                 lambda loc, idx=index: self._on_geo_ready(idx, loc)
@@ -2775,15 +2810,13 @@ class PhotoSelector(QMainWindow):
 
     def _on_rotate_done(self, index: int):
         # Reload the image; _on_image_ready will also update the thumbnail
-        if self._img_loader and self._img_loader.isRunning():
-            self._img_loader.quit()
+        self._retire_loader(self._img_loader)
         self._img_loader = ImageLoader(index, self.photos[index])
         self._img_loader.ready.connect(self._on_image_ready)
         self._img_loader.start()
         # Also refresh EXIF panel (date/dimensions stay same but double-check)
         if self.info_panel.isVisible() and index == self.current_index:
-            if self._exif_loader and self._exif_loader.isRunning():
-                self._exif_loader.quit()
+            self._retire_loader(self._exif_loader)
             self._exif_loader = ExifLoader(index, self.photos[index])
             self._exif_loader.ready.connect(self._on_exif_ready)
             self._exif_loader.start()
@@ -3045,10 +3078,20 @@ class PhotoSelector(QMainWindow):
         for key in ("dark", "light"):
             src  = dlg.paths().get(key, "")
             dest = WATERMARK_DIR / f"{key}.png"
-            if src:
-                shutil.copy2(src, dest)
-            elif dest.exists():
-                dest.unlink()
+            try:
+                if src:
+                    # Re-selecting the already-saved file: nothing to copy, and
+                    # copying a file onto itself fails with WinError 32.
+                    if dest.exists() and Path(src).resolve() == dest.resolve():
+                        continue
+                    shutil.copy2(src, dest)
+                elif dest.exists():
+                    dest.unlink()
+            except PermissionError as e:
+                QMessageBox.warning(
+                    self, "Firma",
+                    f"Impossibile salvare la firma ({key}): il file è in uso "
+                    f"da un altro processo.\n{e}")
 
     def _watermark_context_menu(self, pos):
         wms  = _load_watermarks()
